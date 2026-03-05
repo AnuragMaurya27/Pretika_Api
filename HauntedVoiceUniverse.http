@@ -1,0 +1,6 @@
+@HauntedVoiceUniverse_HostAddress = http://localhost:5182
+
+GET {{HauntedVoiceUniverse_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
