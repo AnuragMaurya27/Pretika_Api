@@ -57,3 +57,4 @@
 /Users/anuragkivani/Downloads/HauntedVoiceUniverse/obj/Debug/net10.0/HauntedVoiceUniverse.genruntimeconfig.cache
 /Users/anuragkivani/Downloads/HauntedVoiceUniverse/obj/Debug/net10.0/ref/HauntedVoiceUniverse.dll
 /Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net10.0/HauntedVoiceUniverse.staticwebassets.runtime.json
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/obj/Debug/net10.0/HauntedVoiceUniverse.sourcelink.json

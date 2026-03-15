@@ -31,6 +31,7 @@ public class ChatMessageResponse
     public Guid RoomId { get; set; }
     public Guid SenderId { get; set; }
     public string SenderUsername { get; set; } = "";
+    public string? SenderDisplayName { get; set; }
     public string? SenderAvatarUrl { get; set; }
     public string MessageType { get; set; } = "";
     public string? Content { get; set; }
@@ -84,4 +85,14 @@ public class StartPrivateChatRequest
 {
     [Required]
     public Guid TargetUserId { get; set; }
+}
+
+public class ReportMessageRequest
+{
+    [Required]
+    [StringLength(50)]
+    public string Reason { get; set; } = "other"; // spam, harassment, inappropriate, other
+
+    [StringLength(500)]
+    public string? Description { get; set; }
 }

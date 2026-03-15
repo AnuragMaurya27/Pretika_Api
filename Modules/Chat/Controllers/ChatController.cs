@@ -2,6 +2,7 @@ using HauntedVoiceUniverse.Common;
 using HauntedVoiceUniverse.Modules.Chat.Models;
 using HauntedVoiceUniverse.Modules.Chat.Services;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
 using System.Security.Claims;
 
@@ -129,6 +130,50 @@ public class ChatController : ControllerBase
     public async Task<IActionResult> BuyStickerPack(Guid id)
     {
         var (success, message) = await _chatService.BuyStickerPackAsync(RequiredUserId, id);
+        if (!success) return BadRequest(ApiResponse<object>.Fail(message));
+        return Ok(ApiResponse<object>.Ok(null, message));
+    }
+
+    // POST /api/chat/upload-image
+    /// <summary>Chat ke liye image upload karo (JPG/PNG/WebP/GIF, max 5MB)</summary>
+    [HttpPost("upload-image")]
+    [Authorize]
+    public async Task<IActionResult> UploadChatImage(IFormFile file)
+    {
+        if (file == null || file.Length == 0)
+            return BadRequest(ApiResponse<object>.Fail("File select karo"));
+
+        var allowed = new[] { "image/jpeg", "image/png", "image/webp", "image/gif" };
+        if (!allowed.Contains(file.ContentType.ToLower()))
+            return BadRequest(ApiResponse<object>.Fail("Sirf JPG, PNG, WebP ya GIF allowed hai"));
+
+        if (file.Length > 5 * 1024 * 1024)
+            return BadRequest(ApiResponse<object>.Fail("Image 5MB se chhoti honi chahiye"));
+
+        var env = HttpContext.RequestServices.GetRequiredService<IWebHostEnvironment>();
+        var wwwroot = env.WebRootPath ?? Path.Combine(Directory.GetCurrentDirectory(), "wwwroot");
+        var folder = Path.Combine(wwwroot, "chat-images");
+        Directory.CreateDirectory(folder);
+
+        var ext = Path.GetExtension(file.FileName).ToLower();
+        if (!new[] { ".jpg", ".jpeg", ".png", ".webp", ".gif" }.Contains(ext)) ext = ".jpg";
+        var fileName = $"{Guid.NewGuid()}{ext}";
+        var filePath = Path.Combine(folder, fileName);
+
+        await using (var stream = new FileStream(filePath, FileMode.Create))
+            await file.CopyToAsync(stream);
+
+        var url = $"/chat-images/{fileName}";
+        return Ok(ApiResponse<object>.Ok(new { url }, "Image upload ho gayi!"));
+    }
+
+    // POST /api/chat/messages/{messageId}/report
+    /// <summary>Message report karo</summary>
+    [HttpPost("messages/{messageId:guid}/report")]
+    [Authorize]
+    public async Task<IActionResult> ReportMessage(Guid messageId, [FromBody] ReportMessageRequest req)
+    {
+        var (success, message) = await _chatService.ReportMessageAsync(RequiredUserId, messageId, req);
         if (!success) return BadRequest(ApiResponse<object>.Fail(message));
         return Ok(ApiResponse<object>.Ok(null, message));
     }

@@ -176,12 +176,15 @@ public class UpdateEpisodeRequest
 
 public class StoryFilterRequest
 {
-    public string? Category { get; set; }
-    public string? Language { get; set; }
-    public string? StoryType { get; set; }
-    public string? AgeRating { get; set; }
-    public string? Search { get; set; }
-    public string SortBy { get; set; } = "latest"; // latest / trending / most_viewed / most_liked
+    public string? Category { get; set; }       // category slug
+    public string? Language { get; set; }       // hindi / hinglish / english
+    public string? StoryType { get; set; }      // single / series
+    public string? AgeRating { get; set; }      // all / 13+ / 16+ / 18+
+    public string? Search { get; set; }         // searches: title, summary, creator username/display, tags
+    public string? CreatorUsername { get; set; }// filter by creator username (exact/partial)
+    public string? DateFrom { get; set; }       // published_at >= DateFrom (ISO yyyy-MM-dd)
+    public string? DateTo { get; set; }         // published_at <= DateTo   (ISO yyyy-MM-dd)
+    public string SortBy { get; set; } = "latest"; // latest / trending / most_viewed / most_liked / recently_updated / top_rated
     public int Page { get; set; } = 1;
     public int PageSize { get; set; } = 20;
 }

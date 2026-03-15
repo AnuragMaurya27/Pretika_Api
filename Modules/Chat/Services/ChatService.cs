@@ -19,6 +19,7 @@ public interface IChatService
     Task<(bool Success, string Message)> LeavePublicRoomAsync(Guid userId, Guid roomId);
     Task<List<StickerPackResponse>> GetStickerPacksAsync(Guid? userId);
     Task<(bool Success, string Message)> BuyStickerPackAsync(Guid userId, Guid packId);
+    Task<(bool Success, string Message)> ReportMessageAsync(Guid userId, Guid messageId, ReportMessageRequest req);
 }
 
 public class ChatService : IChatService
@@ -42,6 +43,7 @@ public class ChatService : IChatService
             RoomId = DbHelper.GetGuid(r, "room_id"),
             SenderId = DbHelper.GetGuid(r, "sender_id"),
             SenderUsername = DbHelper.GetString(r, "sender_username"),
+            SenderDisplayName = DbHelper.GetStringOrNull(r, "sender_display_name"),
             SenderAvatarUrl = DbHelper.GetStringOrNull(r, "sender_avatar_url"),
             MessageType = DbHelper.GetString(r, "message_type"),
             Content = DbHelper.GetBool(r, "is_deleted") ? null : DbHelper.GetStringOrNull(r, "content"),
@@ -197,7 +199,7 @@ public class ChatService : IChatService
             new Dictionary<string, object?> { ["rid"] = roomId });
 
         var messages = await DbHelper.ExecuteReaderAsync(conn,
-            @"SELECT cm.*, u.username as sender_username, u.avatar_url as sender_avatar_url
+            @"SELECT cm.*, u.username as sender_username, u.display_name as sender_display_name, u.avatar_url as sender_avatar_url
               FROM chat_messages cm
               JOIN users u ON u.id = cm.sender_id
               WHERE cm.room_id = @rid
@@ -291,16 +293,28 @@ public class ChatService : IChatService
             "UPDATE chat_rooms SET last_message_at = NOW() WHERE id = @id",
             new Dictionary<string, object?> { ["id"] = roomId });
 
-        var username = await DbHelper.ExecuteScalarAsync<string>(conn,
-            "SELECT username FROM users WHERE id = @uid",
-            new Dictionary<string, object?> { ["uid"] = userId });
+        // Fetch sender info for broadcast
+        string senderUsername = "", senderDisplayName = "", senderAvatarUrl = "";
+        using var uCmd = new NpgsqlCommand("SELECT username, display_name, avatar_url FROM users WHERE id = @uid", conn);
+        uCmd.Parameters.AddWithValue("@uid", userId);
+        using (var uRdr = await uCmd.ExecuteReaderAsync())
+        {
+            if (await uRdr.ReadAsync())
+            {
+                senderUsername = uRdr.IsDBNull(0) ? "" : uRdr.GetString(0);
+                senderDisplayName = uRdr.IsDBNull(1) ? "" : uRdr.GetString(1);
+                senderAvatarUrl = uRdr.IsDBNull(2) ? "" : uRdr.GetString(2);
+            }
+        }
 
         var msgResponse = new ChatMessageResponse
         {
             Id = msgId,
             RoomId = roomId,
             SenderId = userId,
-            SenderUsername = username ?? "",
+            SenderUsername = senderUsername,
+            SenderDisplayName = senderDisplayName,
+            SenderAvatarUrl = senderAvatarUrl,
             MessageType = req.MessageType,
             Content = req.Content,
             ImageUrl = req.ImageUrl,
@@ -467,5 +481,45 @@ public class ChatService : IChatService
             await transaction.RollbackAsync();
             return (false, "Purchase mein error aaya");
         }
+    }
+
+    public async Task<(bool Success, string Message)> ReportMessageAsync(Guid userId, Guid messageId, ReportMessageRequest req)
+    {
+        using var conn = await _db.CreateConnectionAsync();
+
+        // Ensure chat_reports table exists
+        await DbHelper.ExecuteNonQueryAsync(conn,
+            @"CREATE TABLE IF NOT EXISTS chat_reports (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                message_id UUID NOT NULL,
+                reporter_id UUID NOT NULL,
+                reason VARCHAR(50) NOT NULL DEFAULT 'other',
+                description TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(message_id, reporter_id)
+              )",
+            new Dictionary<string, object?>());
+
+        // Check message exists
+        var msgExists = await DbHelper.ExecuteScalarAsync<bool>(conn,
+            "SELECT EXISTS(SELECT 1 FROM chat_messages WHERE id = @id AND is_deleted = FALSE)",
+            new Dictionary<string, object?> { ["id"] = messageId });
+
+        if (!msgExists) return (false, "Message nahi mila");
+
+        // Insert report (ON CONFLICT DO NOTHING for duplicate reports)
+        await DbHelper.ExecuteNonQueryAsync(conn,
+            @"INSERT INTO chat_reports (message_id, reporter_id, reason, description)
+              VALUES (@mid, @uid, @reason, @desc)
+              ON CONFLICT (message_id, reporter_id) DO NOTHING",
+            new Dictionary<string, object?>
+            {
+                ["mid"] = messageId,
+                ["uid"] = userId,
+                ["reason"] = req.Reason,
+                ["desc"] = (object?)req.Description ?? DBNull.Value
+            });
+
+        return (true, "Report submit ho gaya. Team review karegi.");
     }
 }

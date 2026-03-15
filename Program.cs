@@ -170,6 +170,14 @@ builder.Services.AddScoped<HauntedVoiceUniverse.Modules.Chat.Services.IChatServi
 builder.Services.AddScoped<HauntedVoiceUniverse.Modules.Admin.Services.IAdminService,
                              HauntedVoiceUniverse.Modules.Admin.Services.AdminService>();
 
+// Creator (Dashboard Stats)
+builder.Services.AddScoped<HauntedVoiceUniverse.Modules.Creator.Services.ICreatorService,
+                             HauntedVoiceUniverse.Modules.Creator.Services.CreatorService>();
+
+// Search + Reports
+builder.Services.AddScoped<HauntedVoiceUniverse.Modules.Search.Services.ISearchService,
+                             HauntedVoiceUniverse.Modules.Search.Services.SearchService>();
+
 // ─────────────────────────────────────────────────────────────────────────────
 var app = builder.Build();
 

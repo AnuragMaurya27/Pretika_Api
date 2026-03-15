@@ -350,17 +350,49 @@ public class StoryService : IStoryService
         }
         if (!string.IsNullOrEmpty(filter.Search))
         {
-            conditions.Add("s.title ILIKE @search");
+            // Search across: title, summary, creator username/display_name, category name, tags
+            conditions.Add(@"(
+                s.title ILIKE @search
+                OR s.summary ILIKE @search
+                OR u.username ILIKE @search
+                OR u.display_name ILIKE @search
+                OR c.name ILIKE @search
+                OR c.slug ILIKE @search
+                OR EXISTS (
+                    SELECT 1 FROM story_tags st
+                    JOIN tags tg ON tg.id = st.tag_id
+                    WHERE st.story_id = s.id AND tg.name ILIKE @search
+                )
+            )");
             p["@search"] = $"%{filter.Search}%";
+        }
+
+        if (!string.IsNullOrEmpty(filter.CreatorUsername))
+        {
+            conditions.Add("(u.username ILIKE @creatorUser OR u.display_name ILIKE @creatorUser)");
+            p["@creatorUser"] = $"%{filter.CreatorUsername}%";
+        }
+
+        if (!string.IsNullOrEmpty(filter.DateFrom) && DateTime.TryParse(filter.DateFrom, out var dateFrom))
+        {
+            conditions.Add("s.published_at >= @dateFrom");
+            p["@dateFrom"] = dateFrom;
+        }
+        if (!string.IsNullOrEmpty(filter.DateTo) && DateTime.TryParse(filter.DateTo, out var dateTo))
+        {
+            conditions.Add("s.published_at <= @dateTo");
+            p["@dateTo"] = dateTo.AddDays(1); // inclusive of end date
         }
 
         var where = string.Join(" AND ", conditions);
         var orderBy = filter.SortBy switch
         {
-            "trending"    => "s.trending_score DESC",
-            "most_viewed" => "s.total_views DESC",
-            "most_liked"  => "s.total_likes DESC",
-            _             => "s.published_at DESC"
+            "trending"          => "s.trending_score DESC, s.published_at DESC",
+            "most_viewed"       => "s.total_views DESC, s.published_at DESC",
+            "most_liked"        => "s.total_likes DESC, s.published_at DESC",
+            "top_rated"         => "(SELECT COALESCE(AVG(rating),0) FROM story_ratings WHERE story_id=s.id) DESC, s.published_at DESC",
+            "recently_updated"  => "s.updated_at DESC",
+            _                   => "s.published_at DESC"
         };
 
         var pageSize = Math.Min(filter.PageSize, 50);
@@ -372,7 +404,7 @@ public class StoryService : IStoryService
         await using (var conn = await _db.CreateConnectionAsync())
         {
             totalCount = await DbHelper.ExecuteScalarAsync<int>(conn,
-                $"SELECT COUNT(1) FROM stories s LEFT JOIN categories c ON c.id=s.category_id WHERE {where}", p);
+                $"SELECT COUNT(1) FROM stories s JOIN users u ON u.id=s.creator_id LEFT JOIN categories c ON c.id=s.category_id WHERE {where}", p);
 
             p["@limit"] = pageSize;
             p["@offset"] = offset;
