@@ -30,6 +30,7 @@ public class AdminController : ControllerBase
     // GET /api/admin/war-room
     /// <summary>Admin War Room - Real-time dashboard</summary>
     [HttpGet("war-room")]
+    [Authorize(Roles = "super_admin,moderator,finance_manager")]
     public async Task<IActionResult> GetWarRoom()
     {
         var result = await _adminService.GetWarRoomAsync();
@@ -41,6 +42,7 @@ public class AdminController : ControllerBase
     // GET /api/admin/users
     /// <summary>Users list with filters</summary>
     [HttpGet("users")]
+    [Authorize(Roles = "super_admin,moderator,support_agent")]
     public async Task<IActionResult> GetUsers(
         [FromQuery] string? search,
         [FromQuery] string? role,
@@ -55,6 +57,7 @@ public class AdminController : ControllerBase
     // GET /api/admin/users/{id}
     /// <summary>User detail</summary>
     [HttpGet("users/{id:guid}")]
+    [Authorize(Roles = "super_admin,moderator,support_agent")]
     public async Task<IActionResult> GetUser(Guid id)
     {
         var user = await _adminService.GetUserDetailAsync(id);
@@ -190,6 +193,7 @@ public class AdminController : ControllerBase
     // GET /api/admin/stories
     /// <summary>Stories list with filters</summary>
     [HttpGet("stories")]
+    [Authorize(Roles = "super_admin,moderator,content_reviewer")]
     public async Task<IActionResult> GetStories(
         [FromQuery] string? search,
         [FromQuery] string? status,
@@ -227,6 +231,7 @@ public class AdminController : ControllerBase
     // GET /api/admin/reports
     /// <summary>Reports list</summary>
     [HttpGet("reports")]
+    [Authorize(Roles = "super_admin,moderator,content_reviewer")]
     public async Task<IActionResult> GetReports(
         [FromQuery] string? status,
         [FromQuery] string? severity,
@@ -388,9 +393,33 @@ public class AdminController : ControllerBase
     // GET /api/admin/analytics
     /// <summary>Platform analytics</summary>
     [HttpGet("analytics")]
+    [Authorize(Roles = "super_admin,finance_manager,moderator")]
     public async Task<IActionResult> GetAnalytics()
     {
         var result = await _adminService.GetAnalyticsAsync();
         return Ok(ApiResponse<PlatformAnalyticsResponse>.Ok(result));
+    }
+
+    // ─── PLATFORM SETTINGS ───────────────────────────────────────────────────
+
+    // GET /api/admin/platform-settings
+    /// <summary>Platform-wide settings dekho (referral coins, signup bonus, etc.)</summary>
+    [HttpGet("platform-settings")]
+    [Authorize(Roles = "super_admin")]
+    public async Task<IActionResult> GetPlatformSettings()
+    {
+        var result = await _adminService.GetPlatformSettingsAsync();
+        return Ok(ApiResponse<List<PlatformSettingResponse>>.Ok(result));
+    }
+
+    // PUT /api/admin/platform-settings/{key}
+    /// <summary>Platform setting update karo</summary>
+    [HttpPut("platform-settings/{key}")]
+    [Authorize(Roles = "super_admin")]
+    public async Task<IActionResult> UpdatePlatformSetting(string key, [FromBody] UpdatePlatformSettingRequest req)
+    {
+        var (success, message) = await _adminService.UpdatePlatformSettingAsync(key, req.Value);
+        if (!success) return BadRequest(ApiResponse<object>.Fail(message));
+        return Ok(ApiResponse<object>.Ok(null, message));
     }
 }

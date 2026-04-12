@@ -75,10 +75,17 @@ public class SendMessageRequest
     public string? ImageUrl { get; set; }
     public string? StickerId { get; set; }
 
-    // Super chat (0 = no super chat, valid for normal messages)
+    // Super chat: 0 allowed for non-super_chat messages.
+    // BUG#6 FIX: Minimum 10 coins enforced in service layer for super_chat type.
     [Range(0, 10000)]
     public int SuperChatCoins { get; set; } = 0;
     public string? SuperChatHighlightColor { get; set; }
+
+    // BUG#M7-3 FIX: Idempotency key — client generates a UUID per send attempt.
+    // If the same key is seen again (retry after network drop), return the existing message
+    // instead of inserting a duplicate. Client must generate a new UUID for each NEW message.
+    [StringLength(64)]
+    public string? IdempotencyKey { get; set; }
 }
 
 public class StartPrivateChatRequest

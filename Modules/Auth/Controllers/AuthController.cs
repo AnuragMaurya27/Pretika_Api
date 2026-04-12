@@ -31,10 +31,12 @@ public class AuthController : ControllerBase
                 ModelState.Values.SelectMany(v => v.Errors).Select(e => e.ErrorMessage).ToList()));
 
         var ip = GetIpAddress();
-        var (success, message, data) = await _authService.RegisterAsync(req, ip);
+        var (success, message, _) = await _authService.RegisterAsync(req, ip);
 
         if (!success) return BadRequest(ApiResponse<AuthResponse>.Fail(message));
-        return Created("", ApiResponse<AuthResponse>.Created(data!, message));
+        // BUG#M1-2 FIX: RegisterAsync no longer returns tokens — email must be verified first.
+        // Return 201 with just a message; no AuthResponse data.
+        return StatusCode(201, ApiResponse.OkNoData(message));
     }
 
     // ─── POST /api/auth/login ─────────────────────────────────────────────────

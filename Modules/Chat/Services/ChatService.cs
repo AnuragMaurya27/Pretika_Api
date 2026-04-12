@@ -15,6 +15,8 @@ public interface IChatService
     Task<PagedResult<ChatMessageResponse>> GetMessagesAsync(Guid userId, Guid roomId, int page, int pageSize);
     Task<(bool Success, string Message, ChatMessageResponse? Data)> SendMessageAsync(Guid userId, Guid roomId, SendMessageRequest req);
     Task<(bool Success, string Message)> DeleteMessageAsync(Guid userId, Guid messageId);
+    // BUG#M7-7 FIX: Admin-level delete — bypasses sender_id check, broadcasts deletion to all clients.
+    Task<(bool Success, string Message)> AdminDeleteMessageAsync(Guid adminId, Guid messageId);
     Task<(bool Success, string Message)> JoinPublicRoomAsync(Guid userId, Guid roomId);
     Task<(bool Success, string Message)> LeavePublicRoomAsync(Guid userId, Guid roomId);
     Task<List<StickerPackResponse>> GetStickerPacksAsync(Guid? userId);
@@ -60,7 +62,7 @@ public class ChatService : IChatService
 
     public async Task<List<ChatRoomResponse>> GetPublicRoomsAsync(Guid? viewerId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        await using var conn = await _db.CreateConnectionAsync();
 
         var rooms = await DbHelper.ExecuteReaderAsync(conn,
             @"SELECT cr.id, cr.room_type, cr.name, cr.name_hi, cr.description, cr.icon_url,
@@ -91,7 +93,7 @@ public class ChatService : IChatService
 
     public async Task<List<ChatRoomResponse>> GetMyPrivateChatsAsync(Guid userId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        await using var conn = await _db.CreateConnectionAsync();
 
         return await DbHelper.ExecuteReaderAsync(conn,
             @"SELECT cr.id, cr.room_type, cr.last_message_at,
@@ -121,7 +123,7 @@ public class ChatService : IChatService
     {
         if (req.TargetUserId == userId) return (false, "Apne aap se chat nahi kar sakte", null);
 
-        using var conn = await _db.CreateConnectionAsync();
+        await using var conn = await _db.CreateConnectionAsync();
 
         // Check mutual follow
         var mutualFollow = await DbHelper.ExecuteScalarAsync<bool>(conn,
@@ -177,7 +179,7 @@ public class ChatService : IChatService
 
     public async Task<PagedResult<ChatMessageResponse>> GetMessagesAsync(Guid userId, Guid roomId, int page, int pageSize)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        await using var conn = await _db.CreateConnectionAsync();
 
         // Verify access
         var hasAccess = await DbHelper.ExecuteScalarAsync<bool>(conn,
@@ -198,10 +200,15 @@ public class ChatService : IChatService
             "SELECT COUNT(*) FROM chat_messages WHERE room_id = @rid",
             new Dictionary<string, object?> { ["rid"] = roomId });
 
+        // BUG#M7-6 FIX: Changed INNER JOIN → LEFT JOIN so messages from deleted accounts
+        // are not silently dropped. COALESCE returns "[Deleted User]" for missing senders.
         var messages = await DbHelper.ExecuteReaderAsync(conn,
-            @"SELECT cm.*, u.username as sender_username, u.display_name as sender_display_name, u.avatar_url as sender_avatar_url
+            @"SELECT cm.*,
+                     COALESCE(u.username, '[deleted]') as sender_username,
+                     u.display_name as sender_display_name,
+                     u.avatar_url as sender_avatar_url
               FROM chat_messages cm
-              JOIN users u ON u.id = cm.sender_id
+              LEFT JOIN users u ON u.id = cm.sender_id
               WHERE cm.room_id = @rid
               ORDER BY cm.created_at DESC
               LIMIT @limit OFFSET @offset",
@@ -214,7 +221,7 @@ public class ChatService : IChatService
 
     public async Task<(bool Success, string Message, ChatMessageResponse? Data)> SendMessageAsync(Guid userId, Guid roomId, SendMessageRequest req)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        await using var conn = await _db.CreateConnectionAsync();
 
         // Validate room access
         var room = await DbHelper.ExecuteReaderFirstAsync(conn,
@@ -237,112 +244,220 @@ public class ChatService : IChatService
         if (room.RoomType == "private")
         {
             if (room.User1 != userId && room.User2 != userId) return (false, "Is room mein access nahi hai", null);
-        }
 
-        // Super chat handling
-        Guid? txId = null;
-        string? highlightColor = null;
-        if (req.MessageType == "super_chat" && req.SuperChatCoins > 0)
-        {
-            var wallet = await DbHelper.ExecuteReaderFirstAsync(conn,
-                "SELECT coin_balance, is_frozen FROM wallets WHERE user_id = @uid",
-                r => new { Balance = DbHelper.GetLong(r, "coin_balance"), IsFrozen = DbHelper.GetBool(r, "is_frozen") },
-                new Dictionary<string, object?> { ["uid"] = userId });
+            var otherUserId = room.User1 == userId ? room.User2 : room.User1;
 
-            if (wallet == null || wallet.IsFrozen) return (false, "Wallet nahi mila ya frozen hai", null);
-            if (wallet.Balance < req.SuperChatCoins) return (false, "Insufficient coins", null);
-
-            txId = Guid.NewGuid();
-            await DbHelper.ExecuteNonQueryAsync(conn,
-                @"INSERT INTO coin_transactions (id, sender_id, transaction_type, status, amount, reference_type, reference_id, description, completed_at)
-                  VALUES (@id, @uid, 'super_chat', 'completed', @amount, 'chat_room', @rid, 'Super Chat', NOW())",
-                new Dictionary<string, object?> { ["id"] = txId, ["uid"] = userId, ["amount"] = req.SuperChatCoins, ["rid"] = roomId });
-
-            await DbHelper.ExecuteNonQueryAsync(conn,
-                "UPDATE wallets SET coin_balance = coin_balance - @amount, total_spent = total_spent + @amount WHERE user_id = @uid",
-                new Dictionary<string, object?> { ["uid"] = userId, ["amount"] = req.SuperChatCoins });
-
-            highlightColor = req.SuperChatHighlightColor ?? "#FF4444";
-        }
-
-        var msgId = Guid.NewGuid();
-        await DbHelper.ExecuteNonQueryAsync(conn,
-            @"INSERT INTO chat_messages
-                (id, room_id, sender_id, message_type, content, image_url, sticker_id,
-                 is_super_chat, super_chat_coins, super_chat_highlight_color, transaction_id)
-              VALUES
-                (@id, @rid, @uid, @type::message_type, @content, @imgUrl, @stickerId,
-                 @isSuperChat, @superCoins, @highlightColor, @txId)",
-            new Dictionary<string, object?>
+            // BUG#M7-1 FIX: Block check — if either party blocked the other, messages are blocked.
+            if (otherUserId.HasValue)
             {
-                ["id"] = msgId,
-                ["rid"] = roomId,
-                ["uid"] = userId,
-                ["type"] = req.MessageType,
-                ["content"] = (object?)req.Content ?? DBNull.Value,
-                ["imgUrl"] = (object?)req.ImageUrl ?? DBNull.Value,
-                ["stickerId"] = (object?)req.StickerId ?? DBNull.Value,
-                ["isSuperChat"] = req.MessageType == "super_chat",
-                ["superCoins"] = req.SuperChatCoins,
-                ["highlightColor"] = (object?)highlightColor ?? DBNull.Value,
-                ["txId"] = (object?)txId ?? DBNull.Value
-            });
+                var isBlocked = await DbHelper.ExecuteScalarAsync<bool>(conn,
+                    @"SELECT EXISTS(
+                        SELECT 1 FROM blocks
+                        WHERE (blocker_id = @uid AND blocked_id = @other)
+                           OR (blocker_id = @other AND blocked_id = @uid)
+                      )",
+                    new Dictionary<string, object?> { ["uid"] = userId, ["other"] = otherUserId.Value });
+                if (isBlocked) return (false, "Is user ke saath message nahi kar sakte", null);
+            }
 
-        // Update room last_message_at
-        await DbHelper.ExecuteNonQueryAsync(conn,
-            "UPDATE chat_rooms SET last_message_at = NOW() WHERE id = @id",
-            new Dictionary<string, object?> { ["id"] = roomId });
-
-        // Fetch sender info for broadcast
-        string senderUsername = "", senderDisplayName = "", senderAvatarUrl = "";
-        using var uCmd = new NpgsqlCommand("SELECT username, display_name, avatar_url FROM users WHERE id = @uid", conn);
-        uCmd.Parameters.AddWithValue("@uid", userId);
-        using (var uRdr = await uCmd.ExecuteReaderAsync())
-        {
-            if (await uRdr.ReadAsync())
+            // BUG#M7-2 FIX: Re-validate mutual follow — if A or B unfollows, new messages are blocked.
+            // Existing history remains readable (GetMessagesAsync has no such check), only new sends blocked.
+            if (otherUserId.HasValue)
             {
-                senderUsername = uRdr.IsDBNull(0) ? "" : uRdr.GetString(0);
-                senderDisplayName = uRdr.IsDBNull(1) ? "" : uRdr.GetString(1);
-                senderAvatarUrl = uRdr.IsDBNull(2) ? "" : uRdr.GetString(2);
+                var stillMutual = await DbHelper.ExecuteScalarAsync<bool>(conn,
+                    @"SELECT EXISTS(SELECT 1 FROM follows WHERE follower_id = @uid AND following_id = @other)
+                        AND EXISTS(SELECT 1 FROM follows WHERE follower_id = @other AND following_id = @uid)",
+                    new Dictionary<string, object?> { ["uid"] = userId, ["other"] = otherUserId.Value });
+                if (!stillMutual) return (false, "Private chat ke liye mutual follow zaroori hai", null);
             }
         }
 
-        var msgResponse = new ChatMessageResponse
+        // BUG#M7-3 FIX: Idempotency check — prevent duplicate messages on retry
+        if (!string.IsNullOrEmpty(req.IdempotencyKey))
         {
-            Id = msgId,
-            RoomId = roomId,
-            SenderId = userId,
-            SenderUsername = senderUsername,
-            SenderDisplayName = senderDisplayName,
-            SenderAvatarUrl = senderAvatarUrl,
-            MessageType = req.MessageType,
-            Content = req.Content,
-            ImageUrl = req.ImageUrl,
-            StickerId = req.StickerId,
-            IsSuperChat = req.MessageType == "super_chat",
-            SuperChatCoins = req.SuperChatCoins,
-            SuperChatHighlightColor = highlightColor,
-            CreatedAt = DateTime.UtcNow
-        };
+            var existingMsg = await DbHelper.ExecuteReaderFirstAsync(conn,
+                @"SELECT cm.*, u.username as sender_username, u.display_name as sender_display_name, u.avatar_url as sender_avatar_url
+                  FROM chat_messages cm
+                  JOIN users u ON u.id = cm.sender_id
+                  WHERE cm.idempotency_key = @key AND cm.sender_id = @uid AND cm.room_id = @rid",
+                MapMessage,
+                new Dictionary<string, object?> { ["key"] = req.IdempotencyKey, ["uid"] = userId, ["rid"] = roomId });
+            if (existingMsg != null) return (true, "Message already sent", existingMsg);
+        }
 
-        // Broadcast to all connected clients in this room via SignalR
-        _ = _hub.Clients.Group(roomId.ToString()).SendAsync("NewMessage", msgResponse);
+        // BUG#6 FIX: Reject super_chat with 0 coins
+        if (req.MessageType == "super_chat" && req.SuperChatCoins <= 0)
+            return (false, "Super chat ke liye minimum 10 coins chahiye", null);
 
-        return (true, "Message bheja", msgResponse);
+        // BUG#3 + BUG#4 FIX: Wrap ALL super chat coin ops + message insert in ONE transaction
+        Guid? txId = null;
+        string? highlightColor = null;
+
+        using var dbTx = await conn.BeginTransactionAsync();
+        try
+        {
+            if (req.MessageType == "super_chat" && req.SuperChatCoins > 0)
+            {
+                // BUG#4 FIX: FOR UPDATE prevents concurrent over-spend (race condition)
+                var wallet = await DbHelper.ExecuteReaderFirstAsync(conn,
+                    "SELECT coin_balance, is_frozen FROM wallets WHERE user_id = @uid FOR UPDATE",
+                    r => new { Balance = DbHelper.GetLong(r, "coin_balance"), IsFrozen = DbHelper.GetBool(r, "is_frozen") },
+                    new Dictionary<string, object?> { ["uid"] = userId });
+
+                if (wallet == null || wallet.IsFrozen)
+                {
+                    await dbTx.RollbackAsync();
+                    return (false, "Wallet nahi mila ya frozen hai", null);
+                }
+                if (wallet.Balance < req.SuperChatCoins)
+                {
+                    await dbTx.RollbackAsync();
+                    return (false, "Insufficient coins", null);
+                }
+
+                txId = Guid.NewGuid();
+                await DbHelper.ExecuteNonQueryAsync(conn,
+                    @"INSERT INTO coin_transactions
+                        (id, sender_id, transaction_type, status, amount,
+                         reference_type, reference_id, description, completed_at)
+                      VALUES (@id, @uid, 'super_chat', 'completed', @amount,
+                              'chat_room', @rid, 'Super Chat', NOW())",
+                    new Dictionary<string, object?> { ["id"] = txId, ["uid"] = userId, ["amount"] = req.SuperChatCoins, ["rid"] = roomId },
+                    dbTx);
+
+                await DbHelper.ExecuteNonQueryAsync(conn,
+                    "UPDATE wallets SET coin_balance = coin_balance - @amount, total_spent = total_spent + @amount WHERE user_id = @uid",
+                    new Dictionary<string, object?> { ["uid"] = userId, ["amount"] = req.SuperChatCoins },
+                    dbTx);
+
+                highlightColor = req.SuperChatHighlightColor ?? "#FF4444";
+            }
+
+            var msgId = Guid.NewGuid();
+            await DbHelper.ExecuteNonQueryAsync(conn,
+                @"INSERT INTO chat_messages
+                    (id, room_id, sender_id, message_type, content, image_url, sticker_id,
+                     is_super_chat, super_chat_coins, super_chat_highlight_color, transaction_id, idempotency_key)
+                  VALUES
+                    (@id, @rid, @uid, @type::message_type, @content, @imgUrl, @stickerId,
+                     @isSuperChat, @superCoins, @highlightColor, @txId, @ikey)",
+                new Dictionary<string, object?>
+                {
+                    ["id"]             = msgId,
+                    ["rid"]            = roomId,
+                    ["uid"]            = userId,
+                    ["type"]           = req.MessageType,
+                    ["content"]        = (object?)req.Content ?? DBNull.Value,
+                    ["imgUrl"]         = (object?)req.ImageUrl ?? DBNull.Value,
+                    ["stickerId"]      = (object?)req.StickerId ?? DBNull.Value,
+                    ["isSuperChat"]    = req.MessageType == "super_chat",
+                    ["superCoins"]     = req.SuperChatCoins,
+                    ["highlightColor"] = (object?)highlightColor ?? DBNull.Value,
+                    ["txId"]           = (object?)txId ?? DBNull.Value,
+                    ["ikey"]           = (object?)req.IdempotencyKey ?? DBNull.Value
+                }, dbTx);
+
+            // Update room last_message_at
+            await DbHelper.ExecuteNonQueryAsync(conn,
+                "UPDATE chat_rooms SET last_message_at = NOW() WHERE id = @id",
+                new Dictionary<string, object?> { ["id"] = roomId }, dbTx);
+
+            await dbTx.CommitAsync();
+
+            // Fetch sender info for broadcast (after commit — outside locked tx)
+            string senderUsername = "", senderDisplayName = "", senderAvatarUrl = "";
+            using var uCmd = new NpgsqlCommand(
+                "SELECT username, display_name, avatar_url FROM users WHERE id = @uid", conn);
+            uCmd.Parameters.AddWithValue("@uid", userId);
+            using (var uRdr = await uCmd.ExecuteReaderAsync())
+            {
+                if (await uRdr.ReadAsync())
+                {
+                    senderUsername    = uRdr.IsDBNull(0) ? "" : uRdr.GetString(0);
+                    senderDisplayName = uRdr.IsDBNull(1) ? "" : uRdr.GetString(1);
+                    senderAvatarUrl   = uRdr.IsDBNull(2) ? "" : uRdr.GetString(2);
+                }
+            }
+
+            var msgResponse = new ChatMessageResponse
+            {
+                Id                      = msgId,
+                RoomId                  = roomId,
+                SenderId                = userId,
+                SenderUsername          = senderUsername,
+                SenderDisplayName       = senderDisplayName,
+                SenderAvatarUrl         = senderAvatarUrl,
+                MessageType             = req.MessageType,
+                Content                 = req.Content,
+                ImageUrl                = req.ImageUrl,
+                StickerId               = req.StickerId,
+                IsSuperChat             = req.MessageType == "super_chat",
+                SuperChatCoins          = req.SuperChatCoins,
+                SuperChatHighlightColor = highlightColor,
+                CreatedAt               = DateTime.UtcNow
+            };
+
+            // Broadcast to all connected clients in this room via SignalR
+            _ = _hub.Clients.Group(roomId.ToString()).SendAsync("NewMessage", msgResponse);
+
+            return (true, "Message bheja", msgResponse);
+        }
+        catch
+        {
+            // BUG#3 FIX: if message insert fails, coin deduction is also rolled back
+            await dbTx.RollbackAsync();
+            return (false, "Message send karne mein error aaya. Coins deduct nahi hue.", null);
+        }
     }
 
     public async Task<(bool Success, string Message)> DeleteMessageAsync(Guid userId, Guid messageId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        await using var conn = await _db.CreateConnectionAsync();
         var rows = await DbHelper.ExecuteNonQueryAsync(conn,
             "UPDATE chat_messages SET is_deleted = TRUE, deleted_by = @uid, deleted_at = NOW() WHERE id = @id AND sender_id = @uid AND is_deleted = FALSE",
             new Dictionary<string, object?> { ["id"] = messageId, ["uid"] = userId });
+
+        if (rows > 0)
+        {
+            // Broadcast deletion event so all connected clients remove/redact the message
+            var roomId = await DbHelper.ExecuteScalarAsync<string?>(conn,
+                "SELECT room_id::text FROM chat_messages WHERE id = @id",
+                new Dictionary<string, object?> { ["id"] = messageId });
+            if (!string.IsNullOrEmpty(roomId))
+                _ = _hub.Clients.Group(roomId).SendAsync("MessageDeleted", new { MessageId = messageId, RoomId = roomId });
+        }
+
         return rows > 0 ? (true, "Message delete ho gaya") : (false, "Message nahi mila ya pehle se delete hai");
+    }
+
+    // BUG#M7-7 FIX: Admin-level message delete — no sender_id restriction.
+    // Only super_admin and moderator roles should call this (enforced at controller level).
+    // Broadcasts MessageDeleted event to all clients in the room so the message disappears
+    // for everyone, not just the admin's view.
+    public async Task<(bool Success, string Message)> AdminDeleteMessageAsync(Guid adminId, Guid messageId)
+    {
+        await using var conn = await _db.CreateConnectionAsync();
+
+        // Fetch room_id before deleting (needed for broadcast)
+        var roomIdStr = await DbHelper.ExecuteScalarAsync<string?>(conn,
+            "SELECT room_id::text FROM chat_messages WHERE id = @id AND is_deleted = FALSE",
+            new Dictionary<string, object?> { ["id"] = messageId });
+
+        if (string.IsNullOrEmpty(roomIdStr)) return (false, "Message nahi mila ya pehle se delete hai");
+
+        var rows = await DbHelper.ExecuteNonQueryAsync(conn,
+            "UPDATE chat_messages SET is_deleted = TRUE, deleted_by = @admin, deleted_at = NOW() WHERE id = @id AND is_deleted = FALSE",
+            new Dictionary<string, object?> { ["id"] = messageId, ["admin"] = adminId });
+
+        if (rows > 0)
+            _ = _hub.Clients.Group(roomIdStr).SendAsync("MessageDeleted", new { MessageId = messageId, RoomId = roomIdStr });
+
+        return rows > 0 ? (true, "Message admin ne delete kar diya") : (false, "Delete nahi hua");
     }
 
     public async Task<(bool Success, string Message)> JoinPublicRoomAsync(Guid userId, Guid roomId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        await using var conn = await _db.CreateConnectionAsync();
 
         var room = await DbHelper.ExecuteScalarAsync<bool>(conn,
             "SELECT EXISTS(SELECT 1 FROM chat_rooms WHERE id = @id AND room_type = 'public' AND is_active = TRUE)",
@@ -367,7 +482,7 @@ public class ChatService : IChatService
 
     public async Task<(bool Success, string Message)> LeavePublicRoomAsync(Guid userId, Guid roomId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        await using var conn = await _db.CreateConnectionAsync();
         var rows = await DbHelper.ExecuteNonQueryAsync(conn,
             "DELETE FROM chat_room_members WHERE room_id = @rid AND user_id = @uid",
             new Dictionary<string, object?> { ["rid"] = roomId, ["uid"] = userId });
@@ -384,7 +499,7 @@ public class ChatService : IChatService
 
     public async Task<List<StickerPackResponse>> GetStickerPacksAsync(Guid? userId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        await using var conn = await _db.CreateConnectionAsync();
 
         var packs = await DbHelper.ExecuteReaderAsync(conn,
             "SELECT * FROM sticker_packs WHERE is_active = TRUE ORDER BY is_free DESC, coin_cost",
@@ -432,7 +547,7 @@ public class ChatService : IChatService
 
     public async Task<(bool Success, string Message)> BuyStickerPackAsync(Guid userId, Guid packId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        await using var conn = await _db.CreateConnectionAsync();
 
         var pack = await DbHelper.ExecuteReaderFirstAsync(conn,
             "SELECT id, name, coin_cost, is_free FROM sticker_packs WHERE id = @id AND is_active = TRUE",
@@ -448,15 +563,19 @@ public class ChatService : IChatService
             new Dictionary<string, object?> { ["uid"] = userId, ["pid"] = packId });
         if (alreadyOwned) return (false, "Yeh pack pehle se hai aapke paas");
 
-        // Check wallet
-        var balance = await DbHelper.ExecuteScalarAsync<long>(conn,
-            "SELECT coin_balance FROM wallets WHERE user_id = @uid",
-            new Dictionary<string, object?> { ["uid"] = userId });
-        if (balance < pack.Cost) return (false, "Insufficient coins");
-
+        // BUG#5 FIX: FOR UPDATE inside transaction — prevents race condition / negative balance
         using var transaction = await conn.BeginTransactionAsync();
         try
         {
+            var balance = await DbHelper.ExecuteScalarAsync<long>(conn,
+                "SELECT coin_balance FROM wallets WHERE user_id = @uid FOR UPDATE",
+                new Dictionary<string, object?> { ["uid"] = userId });
+            if (balance < pack.Cost)
+            {
+                await transaction.RollbackAsync();
+                return (false, "Insufficient coins");
+            }
+
             await DbHelper.ExecuteNonQueryAsync(conn,
                 "UPDATE wallets SET coin_balance = coin_balance - @amount, total_spent = total_spent + @amount WHERE user_id = @uid",
                 new Dictionary<string, object?> { ["uid"] = userId, ["amount"] = pack.Cost }, transaction);
@@ -485,39 +604,55 @@ public class ChatService : IChatService
 
     public async Task<(bool Success, string Message)> ReportMessageAsync(Guid userId, Guid messageId, ReportMessageRequest req)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        await using var conn = await _db.CreateConnectionAsync();
 
-        // Ensure chat_reports table exists
+        // BUG#M7-9 FIX: chat_reports table now stores room_id and a snapshot of the message
+        // content at report time. Without the snapshot, if admin deletes the message before
+        // reviewing, the context is lost. room_id enables admin to see which room it came from.
         await DbHelper.ExecuteNonQueryAsync(conn,
             @"CREATE TABLE IF NOT EXISTS chat_reports (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 message_id UUID NOT NULL,
+                room_id UUID,
+                sender_id UUID,
                 reporter_id UUID NOT NULL,
                 reason VARCHAR(50) NOT NULL DEFAULT 'other',
                 description TEXT,
+                message_snapshot TEXT,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                resolved_by UUID,
+                resolved_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(message_id, reporter_id)
               )",
             new Dictionary<string, object?>());
 
-        // Check message exists
-        var msgExists = await DbHelper.ExecuteScalarAsync<bool>(conn,
-            "SELECT EXISTS(SELECT 1 FROM chat_messages WHERE id = @id AND is_deleted = FALSE)",
+        // Fetch message context (snapshot before possible deletion)
+        var msg = await DbHelper.ExecuteReaderFirstAsync(conn,
+            "SELECT room_id, sender_id, content FROM chat_messages WHERE id = @id AND is_deleted = FALSE",
+            r => new
+            {
+                RoomId   = r.IsDBNull(r.GetOrdinal("room_id"))   ? (Guid?)null : DbHelper.GetGuid(r, "room_id"),
+                SenderId = r.IsDBNull(r.GetOrdinal("sender_id")) ? (Guid?)null : DbHelper.GetGuid(r, "sender_id"),
+                Content  = DbHelper.GetStringOrNull(r, "content")
+            },
             new Dictionary<string, object?> { ["id"] = messageId });
 
-        if (!msgExists) return (false, "Message nahi mila");
+        if (msg == null) return (false, "Message nahi mila");
 
-        // Insert report (ON CONFLICT DO NOTHING for duplicate reports)
         await DbHelper.ExecuteNonQueryAsync(conn,
-            @"INSERT INTO chat_reports (message_id, reporter_id, reason, description)
-              VALUES (@mid, @uid, @reason, @desc)
+            @"INSERT INTO chat_reports (message_id, room_id, sender_id, reporter_id, reason, description, message_snapshot)
+              VALUES (@mid, @rid, @sid, @uid, @reason, @desc, @snapshot)
               ON CONFLICT (message_id, reporter_id) DO NOTHING",
             new Dictionary<string, object?>
             {
-                ["mid"] = messageId,
-                ["uid"] = userId,
-                ["reason"] = req.Reason,
-                ["desc"] = (object?)req.Description ?? DBNull.Value
+                ["mid"]      = messageId,
+                ["rid"]      = (object?)msg.RoomId   ?? DBNull.Value,
+                ["sid"]      = (object?)msg.SenderId  ?? DBNull.Value,
+                ["uid"]      = userId,
+                ["reason"]   = req.Reason,
+                ["desc"]     = (object?)req.Description ?? DBNull.Value,
+                ["snapshot"] = (object?)msg.Content   ?? DBNull.Value
             });
 
         return (true, "Report submit ho gaya. Team review karegi.");

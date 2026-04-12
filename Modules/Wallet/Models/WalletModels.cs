@@ -139,5 +139,7 @@ public class VerifyRechargeRequest
     [Required]
     public string GatewayTransactionId { get; set; } = "";
 
-    public string? GatewaySignature { get; set; }
+    // BUG#1 FIX: Required for Razorpay — HMAC-SHA256(order_id|payment_id, key_secret)
+    [Required]
+    public string GatewaySignature { get; set; } = "";
 }

@@ -13,7 +13,10 @@ public class RegisterRequest
     [Required, EmailAddress]
     public string Email { get; set; } = "";
 
-    [Required, MinLength(8)]
+    // BUG#M1-1 FIX: Enforce password complexity — at least 1 uppercase, 1 lowercase, 1 digit.
+    [Required, MinLength(8),
+     RegularExpression(@"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$",
+         ErrorMessage = "Password mein kam se kam 8 characters, 1 uppercase, 1 lowercase aur 1 number hona chahiye")]
     public string Password { get; set; } = "";
 
     [MaxLength(100)]
@@ -54,7 +57,10 @@ public class ResetPasswordRequest
     [Required]
     public string Token { get; set; } = "";
 
-    [Required, MinLength(8)]
+    // BUG#M1-1 FIX: same complexity rule as RegisterRequest
+    [Required, MinLength(8),
+     RegularExpression(@"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$",
+         ErrorMessage = "Password mein kam se kam 8 characters, 1 uppercase, 1 lowercase aur 1 number hona chahiye")]
     public string NewPassword { get; set; } = "";
 }
 
@@ -63,7 +69,10 @@ public class ChangePasswordRequest
     [Required]
     public string CurrentPassword { get; set; } = "";
 
-    [Required, MinLength(8)]
+    // BUG#M1-1 FIX: same complexity rule as RegisterRequest
+    [Required, MinLength(8),
+     RegularExpression(@"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$",
+         ErrorMessage = "Password mein kam se kam 8 characters, 1 uppercase, 1 lowercase aur 1 number hona chahiye")]
     public string NewPassword { get; set; } = "";
 }
 

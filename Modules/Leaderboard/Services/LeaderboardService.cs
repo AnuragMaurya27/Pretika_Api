@@ -26,7 +26,9 @@ public class LeaderboardService : ILeaderboardService
 
     public async Task<List<LeaderboardEntryResponse>> GetLeaderboardAsync(string type, string? periodType, Guid? viewerId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M6-4 FIX: NpgsqlConnection implements IAsyncDisposable; synchronous using
+        // bypasses async teardown. Changed all 6 methods to await using.
+        await using var conn = await _db.CreateConnectionAsync();
 
         // If leaderboard data exists, fetch from table
         var whereParts = new List<string> { "lb.leaderboard_type = @type" };
@@ -90,7 +92,9 @@ public class LeaderboardService : ILeaderboardService
 
     public async Task<List<CompetitionResponse>> GetCompetitionsAsync(bool activeOnly, Guid? viewerId, int page, int pageSize)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M6-4 FIX: NpgsqlConnection implements IAsyncDisposable; synchronous using
+        // bypasses async teardown. Changed all 6 methods to await using.
+        await using var conn = await _db.CreateConnectionAsync();
         pageSize = Math.Min(pageSize, 50);
         int offset = (page - 1) * pageSize;
 
@@ -155,7 +159,9 @@ public class LeaderboardService : ILeaderboardService
 
     public async Task<CompetitionResponse?> GetCompetitionAsync(Guid competitionId, Guid? viewerId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M6-4 FIX: NpgsqlConnection implements IAsyncDisposable; synchronous using
+        // bypasses async teardown. Changed all 6 methods to await using.
+        await using var conn = await _db.CreateConnectionAsync();
 
         var comp = await DbHelper.ExecuteReaderFirstAsync(conn,
             "SELECT * FROM competitions WHERE id = @id",
@@ -206,7 +212,9 @@ public class LeaderboardService : ILeaderboardService
 
     public async Task<PagedResult<CompetitionEntryResponse>> GetCompetitionEntriesAsync(Guid competitionId, Guid? viewerId, int page, int pageSize)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M6-4 FIX: NpgsqlConnection implements IAsyncDisposable; synchronous using
+        // bypasses async teardown. Changed all 6 methods to await using.
+        await using var conn = await _db.CreateConnectionAsync();
         pageSize = Math.Min(pageSize, 50);
         int offset = (page - 1) * pageSize;
 
@@ -252,7 +260,9 @@ public class LeaderboardService : ILeaderboardService
 
     public async Task<(bool Success, string Message)> SubmitEntryAsync(Guid userId, Guid competitionId, SubmitEntryRequest req)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M6-4 FIX: NpgsqlConnection implements IAsyncDisposable; synchronous using
+        // bypasses async teardown. Changed all 6 methods to await using.
+        await using var conn = await _db.CreateConnectionAsync();
 
         var comp = await DbHelper.ExecuteReaderFirstAsync(conn,
             "SELECT id, submission_start, submission_end, max_entries_per_user FROM competitions WHERE id = @id AND is_active = TRUE",
@@ -271,11 +281,14 @@ public class LeaderboardService : ILeaderboardService
         if (now < comp.SubStart) return (false, "Submission abhi shuru nahi hui");
         if (now > comp.SubEnd) return (false, "Submission window band ho gayi");
 
-        // Check already entered
-        var alreadyEntered = await DbHelper.ExecuteScalarAsync<bool>(conn,
-            "SELECT EXISTS(SELECT 1 FROM competition_entries WHERE competition_id = @cid AND user_id = @uid)",
+        // BUG#M6-6 FIX: alreadyEntered was a bool EXISTS check — always blocked the 2nd
+        // entry even if max_entries_per_user > 1 (e.g. admin allows 3 entries per user).
+        // Now compare actual entry COUNT against the competition's max_entries_per_user.
+        var existingEntries = await DbHelper.ExecuteScalarAsync<int>(conn,
+            "SELECT COUNT(*) FROM competition_entries WHERE competition_id = @cid AND user_id = @uid",
             new Dictionary<string, object?> { ["cid"] = competitionId, ["uid"] = userId });
-        if (alreadyEntered) return (false, "Pehle se entry submit hai");
+        if (existingEntries >= comp.MaxEntries)
+            return (false, $"Max {comp.MaxEntries} entr{(comp.MaxEntries == 1 ? "y" : "ies")} allowed");
 
         // Check story ownership
         var storyOwned = await DbHelper.ExecuteScalarAsync<bool>(conn,
@@ -296,7 +309,9 @@ public class LeaderboardService : ILeaderboardService
 
     public async Task<(bool Success, string Message)> VoteForEntryAsync(Guid userId, Guid competitionId, Guid entryId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M6-4 FIX: NpgsqlConnection implements IAsyncDisposable; synchronous using
+        // bypasses async teardown. Changed all 6 methods to await using.
+        await using var conn = await _db.CreateConnectionAsync();
 
         // Check competition is in voting phase
         var comp = await DbHelper.ExecuteReaderFirstAsync(conn,

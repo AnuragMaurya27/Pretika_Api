@@ -34,6 +34,7 @@ public class UserProfileResponse
 
     // Viewer context (only when logged in)
     public bool? IsFollowing { get; set; }
+    public bool? IsFollowedByThem { get; set; }
     public bool? IsBlockedByMe { get; set; }
 
     public string? ReferralCode { get; set; }
@@ -71,6 +72,24 @@ public class FollowUserResponse
     public int TotalFollowers { get; set; }
     public bool? IsFollowing { get; set; }
     public DateTime FollowedAt { get; set; }
+}
+
+// ─── Referral DTOs ────────────────────────────────────────────────────────────
+
+public class ReferredUserInfo
+{
+    public string Username { get; set; } = "";
+    public string? DisplayName { get; set; }
+    public string? AvatarUrl { get; set; }
+    public DateTime JoinedAt { get; set; }
+}
+
+public class ReferralStatsResponse
+{
+    public string? ReferralCode { get; set; }
+    public int TotalReferrals { get; set; }
+    public int CoinsPerReferral { get; set; } = 100;
+    public List<ReferredUserInfo> ReferredUsers { get; set; } = new();
 }
 
 // ─── Request DTOs ─────────────────────────────────────────────────────────────

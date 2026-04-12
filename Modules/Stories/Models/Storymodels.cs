@@ -27,6 +27,10 @@ public class StoryResponse
     public Guid? CategoryId { get; set; }
     public string? CategoryName { get; set; }
 
+    // Collection
+    public Guid? CollectionId { get; set; }
+    public string? CollectionName { get; set; }
+
     // Tags
     public List<string> Tags { get; set; } = new();
 
@@ -87,7 +91,12 @@ public class EpisodeResponse
     public bool IsUnlocked { get; set; }
     public bool? IsLiked { get; set; }
 
+    // Viewer's existing rating for this episode's story (1-5, null if not rated)
+    public int? UserRating { get; set; }
+
     public DateTime? PublishedAt { get; set; }
+    // BUG#M3-5 FIX: Return scheduled_publish_at so Flutter editor can restore the saved schedule
+    public DateTime? ScheduledPublishAt { get; set; }
     public DateTime CreatedAt { get; set; }
 }
 
@@ -187,4 +196,47 @@ public class StoryFilterRequest
     public string SortBy { get; set; } = "latest"; // latest / trending / most_viewed / most_liked / recently_updated / top_rated
     public int Page { get; set; } = 1;
     public int PageSize { get; set; } = 20;
+}
+
+// ─── Collection DTOs ──────────────────────────────────────────────────────────
+
+public class CollectionResponse
+{
+    public Guid Id { get; set; }
+    public Guid CreatorId { get; set; }
+    public string Name { get; set; } = "";
+    public string? Description { get; set; }
+    public string? CoverUrl { get; set; }
+    public bool IsPublic { get; set; }
+    public int TotalStories { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+
+public class CreateCollectionRequest
+{
+    [Required, MaxLength(255)]
+    public string Name { get; set; } = "";
+
+    [MaxLength(1000)]
+    public string? Description { get; set; }
+
+    [MaxLength(500)]
+    public string? CoverUrl { get; set; }
+
+    public bool IsPublic { get; set; } = true;
+}
+
+public class UpdateCollectionRequest
+{
+    [MaxLength(255)]
+    public string? Name { get; set; }
+
+    [MaxLength(1000)]
+    public string? Description { get; set; }
+
+    [MaxLength(500)]
+    public string? CoverUrl { get; set; }
+
+    public bool? IsPublic { get; set; }
 }

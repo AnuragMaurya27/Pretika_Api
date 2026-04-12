@@ -23,6 +23,16 @@ builder.Services.AddSingleton<IDbConnectionFactory, DbConnectionFactory>();
 // ─── 3. JWT Authentication ────────────────────────────────────────────────────
 var jwtConfig = builder.Configuration.GetSection("Jwt");
 var secretKey = jwtConfig["SecretKey"] ?? throw new Exception("JWT SecretKey missing");
+
+// VULN#2 FIX: Fail fast if placeholder or weak key is still in config.
+// A committed placeholder allows anyone with repo access to forge admin JWTs.
+const string jwtPlaceholder = "YOUR_SUPER_SECRET_JWT_KEY_MIN_32_CHARS_HERE";
+if (secretKey == jwtPlaceholder || secretKey.Length < 64)
+    throw new Exception(
+        "FATAL: JWT SecretKey is a placeholder or too short (min 64 chars). " +
+        "Set a cryptographically random key via environment variable: " +
+        "export Jwt__SecretKey=\"$(openssl rand -base64 64)\"");
+
 var keyBytes = Encoding.UTF8.GetBytes(secretKey);
 
 builder.Services.AddAuthentication(opt =>
@@ -32,7 +42,8 @@ builder.Services.AddAuthentication(opt =>
 })
 .AddJwtBearer(opt =>
 {
-    opt.RequireHttpsMetadata = false;
+    // VULN#9 FIX: Only allow HTTP in development. Production must use HTTPS.
+    opt.RequireHttpsMetadata = !builder.Environment.IsDevelopment();
     opt.SaveToken = true;
     opt.TokenValidationParameters = new TokenValidationParameters
     {
@@ -67,13 +78,19 @@ builder.Services.AddAuthentication(opt =>
 builder.Services.AddAuthorization();
 
 // ─── 4. CORS ──────────────────────────────────────────────────────────────────
+// VULN#1 FIX: Replace wildcard SetIsOriginAllowed with exact-match allowlist from config.
+// Wildcard + AllowCredentials lets any origin make authenticated requests → CSRF/data theft.
+var allowedCorsOrigins = builder.Configuration
+    .GetSection("Cors:AllowedOrigins")
+    .Get<string[]>() ?? Array.Empty<string>();
+if (allowedCorsOrigins.Length == 0 && !builder.Environment.IsDevelopment())
+    throw new Exception("FATAL: Cors:AllowedOrigins must be configured for non-development environments.");
+
 builder.Services.AddCors(opt =>
 {
     opt.AddDefaultPolicy(policy =>
     {
-        // AllowAnyOrigin() can't be combined with AllowCredentials (needed for SignalR)
-        // So we use SetIsOriginAllowed with AllowCredentials
-        policy.SetIsOriginAllowed(_ => true)
+        policy.WithOrigins(allowedCorsOrigins)
               .AllowAnyHeader()
               .AllowAnyMethod()
               .AllowCredentials();
@@ -170,6 +187,10 @@ builder.Services.AddScoped<HauntedVoiceUniverse.Modules.Chat.Services.IChatServi
 builder.Services.AddScoped<HauntedVoiceUniverse.Modules.Admin.Services.IAdminService,
                              HauntedVoiceUniverse.Modules.Admin.Services.AdminService>();
 
+// Subscriptions
+builder.Services.AddScoped<HauntedVoiceUniverse.Modules.Subscriptions.Services.ISubscriptionService,
+                             HauntedVoiceUniverse.Modules.Subscriptions.Services.SubscriptionService>();
+
 // Creator (Dashboard Stats)
 builder.Services.AddScoped<HauntedVoiceUniverse.Modules.Creator.Services.ICreatorService,
                              HauntedVoiceUniverse.Modules.Creator.Services.CreatorService>();
@@ -178,25 +199,45 @@ builder.Services.AddScoped<HauntedVoiceUniverse.Modules.Creator.Services.ICreato
 builder.Services.AddScoped<HauntedVoiceUniverse.Modules.Search.Services.ISearchService,
                              HauntedVoiceUniverse.Modules.Search.Services.SearchService>();
 
+// BUG#M3-8 FIX: Background job that publishes scheduled episodes at their due time.
+// Without this, episodes with scheduled_publish_at stayed 'draft' forever.
+builder.Services.AddHostedService<HauntedVoiceUniverse.Infrastructure.BackgroundJobs.ScheduledPublishJob>();
+
+// Darr Arena
+builder.Services.AddScoped<HauntedVoiceUniverse.Modules.Arena.Services.IArenaService,
+                             HauntedVoiceUniverse.Modules.Arena.Services.ArenaService>();
+builder.Services.AddHostedService<HauntedVoiceUniverse.Modules.Arena.Jobs.ArenaPhaseTransitionJob>();
+builder.Services.AddHostedService<HauntedVoiceUniverse.Modules.Arena.Jobs.ArenaForfeitDetectionJob>();
+
 // ─────────────────────────────────────────────────────────────────────────────
 var app = builder.Build();
 
 // ─── Middleware Pipeline ──────────────────────────────────────────────────────
 
-// ✅ Swagger - hamesha ON (development + production dono mein)
-app.UseSwagger();
-app.UseSwaggerUI(c =>
+// VULN#10 FIX: Swagger only in development. In production, full API schema at root URL
+// exposes every endpoint, parameter, and auth scheme to attackers/scrapers.
+if (app.Environment.IsDevelopment())
 {
-    c.SwaggerEndpoint("/swagger/v1/swagger.json", "HVU API v1");
-    c.RoutePrefix = string.Empty; // ✅ Root URL pe milega: http://localhost:5182
-    c.DocumentTitle = "👻 Haunted Voice Universe API";
-    c.DefaultModelsExpandDepth(-1); // Models section collapse rahega
-});
+    app.UseSwagger();
+    app.UseSwaggerUI(c =>
+    {
+        c.SwaggerEndpoint("/swagger/v1/swagger.json", "HVU API v1");
+        c.RoutePrefix = string.Empty;
+        c.DocumentTitle = "👻 Haunted Voice Universe API";
+        c.DefaultModelsExpandDepth(-1);
+    });
+}
 
 app.UseIpRateLimiting();
 app.UseCors();
 app.UseStaticFiles(); // ✅ Avatar/Cover images serve karega: /uploads/avatars/...
 app.UseAuthentication();
+// BUG#A5 FIX: Check user's account status (ban/suspend) on every authenticated request.
+// JWT stays valid after ban unless we check the DB — this middleware closes that gap.
+app.UseMiddleware<HauntedVoiceUniverse.Infrastructure.Middleware.BannedUserMiddleware>();
+// VULN#15 FIX: Per-user identity-based rate limiting for sensitive endpoints.
+// Runs after auth so userId is resolved. Complements IP-based AspNetCoreRateLimit.
+app.UseMiddleware<HauntedVoiceUniverse.Infrastructure.Middleware.UserRateLimitMiddleware>();
 app.UseAuthorization();
 app.MapControllers();
 app.MapHub<ChatHub>("/hubs/chat");

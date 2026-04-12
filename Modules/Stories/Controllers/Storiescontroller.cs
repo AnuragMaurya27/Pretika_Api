@@ -43,9 +43,12 @@ public class StoriesController : ControllerBase
         return Ok(ApiResponse<List<CategoryResponse>>.Ok(result));
     }
 
-    /// <summary>Nai category banao (koi bhi logged-in user)</summary>
+    // VULN#7 FIX: Category management restricted to admin roles only.
+    // Previously [Authorize] only — any logged-in user could create/delete categories,
+    // spamming or vandalizing the global category taxonomy.
+    /// <summary>Nai category banao (admin only)</summary>
     [HttpPost("categories")]
-    [Authorize]
+    [Authorize(Roles = "super_admin,moderator")]
     public async Task<IActionResult> CreateCategory([FromBody] CreateCategoryRequest req)
     {
         var (success, message, data) = await _storyService.CreateCategoryAsync(req.Name, req.Description, req.IconUrl);
@@ -53,9 +56,9 @@ public class StoriesController : ControllerBase
         return Ok(ApiResponse<CategoryResponse>.Ok(data!, message));
     }
 
-    /// <summary>Category delete karo (admin only — enforced at admin level too)</summary>
+    /// <summary>Category delete karo (admin only)</summary>
     [HttpDelete("categories/{categoryId:guid}")]
-    [Authorize]
+    [Authorize(Roles = "super_admin")]
     public async Task<IActionResult> DeleteCategory(Guid categoryId)
     {
         var (success, message) = await _storyService.DeleteCategoryAsync(categoryId);
@@ -292,6 +295,36 @@ public class StoriesController : ControllerBase
         return Ok(ApiResponse<object>.Ok(null, message));
     }
 
+    /// <summary>Episode like karo</summary>
+    [HttpPost("{storyId:guid}/episodes/{episodeId:guid}/like")]
+    [Authorize]
+    public async Task<IActionResult> LikeEpisode(Guid storyId, Guid episodeId)
+    {
+        var (success, message) = await _storyService.LikeEpisodeAsync(RequiredUserId, storyId, episodeId);
+        if (!success) return BadRequest(ApiResponse<object>.Fail(message));
+        return Ok(ApiResponse<object>.Ok(null, message));
+    }
+
+    /// <summary>Episode unlike karo</summary>
+    [HttpDelete("{storyId:guid}/episodes/{episodeId:guid}/like")]
+    [Authorize]
+    public async Task<IActionResult> UnlikeEpisode(Guid storyId, Guid episodeId)
+    {
+        var (success, message) = await _storyService.UnlikeEpisodeAsync(RequiredUserId, storyId, episodeId);
+        if (!success) return BadRequest(ApiResponse<object>.Fail(message));
+        return Ok(ApiResponse<object>.Ok(null, message));
+    }
+
+    /// <summary>Episode ko rate karo (1-5 stars)</summary>
+    [HttpPost("{storyId:guid}/episodes/{episodeId:guid}/rate")]
+    [Authorize]
+    public async Task<IActionResult> RateEpisode(Guid storyId, Guid episodeId, [FromBody] RateStoryRequest req)
+    {
+        var (success, message, data) = await _storyService.RateEpisodeAsync(RequiredUserId, storyId, episodeId, req.Rating);
+        if (!success) return BadRequest(ApiResponse<object>.Fail(message));
+        return Ok(ApiResponse<object>.Ok(data, message));
+    }
+
     /// <summary>Premium episode unlock karo coins se</summary>
     [HttpPost("episodes/{episodeId:guid}/unlock")]
     [Authorize]
@@ -304,16 +337,22 @@ public class StoriesController : ControllerBase
 
     // ─── THUMBNAIL UPLOAD ─────────────────────────────────────────────────────
     /// <summary>Story thumbnail image upload karo (JPG/PNG/WebP, max 5MB)</summary>
+    // BUG#M3-10 FIX: Limit request size to 6MB so 50MB uploads are rejected
+    // before they're fully buffered in memory.
     [HttpPost("upload-thumbnail")]
     [Authorize]
+    [RequestSizeLimit(6 * 1024 * 1024)]
+    [RequestFormLimits(MultipartBodyLengthLimit = 6 * 1024 * 1024)]
     public async Task<IActionResult> UploadThumbnail(IFormFile file)
     {
         if (file == null || file.Length == 0)
             return BadRequest(ApiResponse<object>.Fail("File select karo"));
 
-        var allowed = new[] { "image/jpeg", "image/png", "image/webp", "image/gif" };
-        if (!allowed.Contains(file.ContentType.ToLower()))
-            return BadRequest(ApiResponse<object>.Fail("Sirf JPG, PNG, WebP ya GIF allowed hai"));
+        // BUG#M3-2 FIX: Do NOT trust Content-Type — validate actual magic bytes.
+        // An attacker can rename any file to .jpg and set Content-Type: image/jpeg.
+        var magicResult = await DetectImageTypeAsync(file);
+        if (magicResult == null)
+            return BadRequest(ApiResponse<object>.Fail("Invalid file. Sirf JPG, PNG, WebP ya GIF allowed hai"));
 
         if (file.Length > 5 * 1024 * 1024)
             return BadRequest(ApiResponse<object>.Fail("Image 5MB se chhoti honi chahiye"));
@@ -322,9 +361,8 @@ public class StoriesController : ControllerBase
         var folder = Path.Combine(wwwroot, "thumbnail");
         Directory.CreateDirectory(folder);
 
-        var ext = Path.GetExtension(file.FileName).ToLower();
-        if (!new[] { ".jpg", ".jpeg", ".png", ".webp", ".gif" }.Contains(ext)) ext = ".jpg";
-        var fileName = $"{Guid.NewGuid()}{ext}";
+        // Always use the magic-byte-detected extension, never the original filename
+        var fileName = $"{Guid.NewGuid()}{magicResult}";
         var filePath = Path.Combine(folder, fileName);
 
         await using (var stream = new FileStream(filePath, FileMode.Create))
@@ -332,6 +370,64 @@ public class StoriesController : ControllerBase
 
         var url = $"/thumbnail/{fileName}";
         return Ok(ApiResponse<object>.Ok(new { url }, "Thumbnail upload ho gaya!"));
+    }
+
+    // ─── CONTENT IMAGE UPLOAD ─────────────────────────────────────────────────
+    /// <summary>Episode content ke liye image upload karo (JPG/PNG/WebP, max 5MB)</summary>
+    [HttpPost("upload-image")]
+    [Authorize]
+    [RequestSizeLimit(6 * 1024 * 1024)]
+    [RequestFormLimits(MultipartBodyLengthLimit = 6 * 1024 * 1024)]
+    public async Task<IActionResult> UploadContentImage(IFormFile file)
+    {
+        if (file == null || file.Length == 0)
+            return BadRequest(ApiResponse<object>.Fail("File select karo"));
+
+        var magicResult = await DetectImageTypeAsync(file);
+        if (magicResult == null)
+            return BadRequest(ApiResponse<object>.Fail("Invalid file. Sirf JPG, PNG, WebP ya GIF allowed hai"));
+
+        if (file.Length > 5 * 1024 * 1024)
+            return BadRequest(ApiResponse<object>.Fail("Image 5MB se chhoti honi chahiye"));
+
+        var wwwroot = _env.WebRootPath ?? Path.Combine(Directory.GetCurrentDirectory(), "wwwroot");
+        var folder = Path.Combine(wwwroot, "content-images");
+        Directory.CreateDirectory(folder);
+
+        var fileName = $"{Guid.NewGuid()}{magicResult}";
+        var filePath = Path.Combine(folder, fileName);
+
+        await using (var stream = new FileStream(filePath, FileMode.Create))
+            await file.CopyToAsync(stream);
+
+        var url = $"/content-images/{fileName}";
+        return Ok(ApiResponse<object>.Ok(new { url }, "Image upload ho gayi!"));
+    }
+
+    /// <summary>
+    /// BUG#M3-2 FIX: Read first 12 bytes and compare against known image magic numbers.
+    /// Returns the canonical extension (e.g. ".jpg") or null if not a recognised image.
+    /// </summary>
+    private static async Task<string?> DetectImageTypeAsync(IFormFile file)
+    {
+        var header = new byte[12];
+        await using var stream = file.OpenReadStream();
+        var read = await stream.ReadAsync(header.AsMemory(0, header.Length));
+        if (read < 4) return null;
+
+        // JPEG: FF D8 FF
+        if (header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF) return ".jpg";
+        // PNG: 89 50 4E 47 0D 0A 1A 0A
+        if (header[0] == 0x89 && header[1] == 0x50 && header[2] == 0x4E && header[3] == 0x47) return ".png";
+        // GIF: 47 49 46 38
+        if (header[0] == 0x47 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x38) return ".gif";
+        // WebP: RIFF????WEBP (bytes 0-3 = RIFF, bytes 8-11 = WEBP)
+        if (read >= 12 &&
+            header[0] == 0x52 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x46 &&
+            header[8] == 0x57 && header[9] == 0x45 && header[10] == 0x42 && header[11] == 0x50)
+            return ".webp";
+
+        return null; // Unknown / not an image
     }
 
     private IWebHostEnvironment _env =>

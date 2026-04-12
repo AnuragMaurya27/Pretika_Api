@@ -74,9 +74,10 @@ public static class DbHelper
         NpgsqlConnection conn,
         string sql,
         Func<NpgsqlDataReader, T> mapper,
-        Dictionary<string, object?>? parameters = null)
+        Dictionary<string, object?>? parameters = null,
+        NpgsqlTransaction? transaction = null)
     {
-        using var cmd = new NpgsqlCommand(sql, conn);
+        using var cmd = new NpgsqlCommand(sql, conn, transaction);
         AddParameters(cmd, parameters);
 
         var results = new List<T>();
@@ -96,9 +97,10 @@ public static class DbHelper
         NpgsqlConnection conn,
         string sql,
         Func<NpgsqlDataReader, T> mapper,
-        Dictionary<string, object?>? parameters = null)
+        Dictionary<string, object?>? parameters = null,
+        NpgsqlTransaction? transaction = null)
     {
-        using var cmd = new NpgsqlCommand(sql, conn);
+        using var cmd = new NpgsqlCommand(sql, conn, transaction);
         AddParameters(cmd, parameters);
 
         using var reader = await cmd.ExecuteReaderAsync();

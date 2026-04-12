@@ -78,13 +78,16 @@ public class SearchService : ISearchService
             // Count total for users-only mode
             if (searchType == "users")
             {
+                // BUG#M9-4 FIX: count must also exclude shadow-banned users.
                 response.TotalUsers = await DbHelper.ExecuteScalarAsync<int>(conn,
                     @"SELECT COUNT(1) FROM users
                       WHERE deleted_at IS NULL
+                        AND status NOT IN ('shadow_banned','banned','suspended')
                         AND (LOWER(username) LIKE @q OR LOWER(display_name) LIKE @q OR LOWER(bio) LIKE @q)",
                     new() { ["@q"] = pattern });
             }
 
+            // BUG#M9-4 FIX: Exclude shadow-banned (and banned/suspended/deleted) users from search.
             response.Users = await DbHelper.ExecuteReaderAsync(conn,
                 @"SELECT u.id, u.username, u.display_name, u.avatar_url, u.bio,
                          u.is_creator, u.is_verified_creator,
@@ -92,6 +95,7 @@ public class SearchService : ISearchService
                          u.total_followers, u.total_stories_published
                   FROM users u
                   WHERE u.deleted_at IS NULL
+                    AND u.status NOT IN ('shadow_banned','banned','suspended')
                     AND (LOWER(u.username) LIKE @q OR LOWER(u.display_name) LIKE @q OR LOWER(u.bio) LIKE @q)
                   ORDER BY u.is_verified_creator DESC, u.total_followers DESC NULLS LAST
                   LIMIT @lim OFFSET @off",
@@ -140,10 +144,21 @@ public class SearchService : ISearchService
         if (req.EntityType.ToLower() == "user" && req.EntityId == reporterId)
             return (false, "Aap apne aap ko report nahi kar sakte.");
 
-        // Check for duplicate report within 24h
         await using var conn = await _db.CreateConnectionAsync();
+
+        // BUG#M9-10 FIX: Per-user rate limit — max 20 reports per hour to prevent abuse.
+        var recentReports = await DbHelper.ExecuteScalarAsync<int>(conn,
+            @"SELECT COUNT(1) FROM reports
+              WHERE reporter_id = @rid AND created_at > NOW() - INTERVAL '1 hour'",
+            new() { ["@rid"] = reporterId });
+        if (recentReports >= 20)
+            return (false, "Aap ek ghante mein zyada reports submit nahi kar sakte. Baad mein try karo.");
+
+        // BUG#M9-1 FIX: All reports go to the unified 'reports' table (previously story/user/episode
+        // reports went to 'user_reports' which the admin panel never reads — making them invisible).
+        // Check for duplicate report within 24h
         var existing = await DbHelper.ExecuteScalarAsync<int>(conn,
-            @"SELECT COUNT(1) FROM user_reports
+            @"SELECT COUNT(1) FROM reports
               WHERE reporter_id=@rid AND entity_id=@eid AND entity_type=@etype
                 AND created_at > NOW() - INTERVAL '24 hours'",
             new() { ["@rid"] = reporterId, ["@eid"] = req.EntityId, ["@etype"] = req.EntityType.ToLower() });
@@ -155,20 +170,65 @@ public class SearchService : ISearchService
         if (description?.Length > 500)
             description = description[..500];
 
+        // BUG#M9-8 FIX (partial): Assign severity based on reason so the admin queue can sort
+        // high-severity reports to the top. hate_speech/adult_content = critical; inappropriate = high;
+        // others = medium. The queue ORDER BY severity DESC will surface urgent reports first.
+        var severity = req.Reason.ToLower() switch
+        {
+            "hate_speech"     => "critical",
+            "adult_content"   => "critical",
+            "inappropriate"   => "high",
+            "misinformation"  => "high",
+            "spam"            => "medium",
+            "copyright"       => "medium",
+            _                 => "low",
+        };
+
         try
         {
+            // BUG#M9-1 FIX: Insert into 'reports' table (same table admin panel reads).
             await DbHelper.ExecuteNonQueryAsync(conn,
-                @"INSERT INTO user_reports (id, reporter_id, entity_type, entity_id, reason, description, status, created_at)
-                  VALUES (@id, @rid, @etype, @eid, @reason, @desc, 'pending', NOW())",
+                @"INSERT INTO reports (reporter_id, entity_type, entity_id, reason, custom_reason, severity, status, created_at)
+                  VALUES (@rid, @etype, @eid, @reason, @custom, @sev::report_severity, 'pending', NOW())",
                 new()
                 {
-                    ["@id"]     = Guid.NewGuid(),
                     ["@rid"]    = reporterId,
                     ["@etype"]  = req.EntityType.ToLower(),
                     ["@eid"]    = req.EntityId,
                     ["@reason"] = req.Reason.ToLower(),
-                    ["@desc"]   = (object?)description ?? DBNull.Value,
+                    ["@custom"] = (object?)description ?? DBNull.Value,
+                    ["@sev"]    = severity,
                 });
+
+            // BUG#M9-2 FIX: Auto-hide content when ≥10 unique users report the same entity
+            // within 24h — prevents coordinated harassment campaigns from harming creators
+            // while awaiting manual review.
+            var reportCount = await DbHelper.ExecuteScalarAsync<int>(conn,
+                @"SELECT COUNT(DISTINCT reporter_id) FROM reports
+                  WHERE entity_id=@eid AND entity_type=@etype AND status='pending'
+                    AND created_at > NOW() - INTERVAL '24 hours'",
+                new() { ["@eid"] = req.EntityId, ["@etype"] = req.EntityType.ToLower() });
+
+            if (reportCount >= 10)
+            {
+                // Auto-hide content pending review — does NOT permanently ban/remove.
+                // Story/episode: set status to 'under_review'; comment: set is_hidden=TRUE; user: flag only.
+                switch (req.EntityType.ToLower())
+                {
+                    case "story":
+                    case "episode":
+                        await DbHelper.ExecuteNonQueryAsync(conn,
+                            "UPDATE stories SET status='under_review'::story_status WHERE id=@id AND status='published'",
+                            new() { ["@id"] = req.EntityId });
+                        break;
+                    case "comment":
+                        await DbHelper.ExecuteNonQueryAsync(conn,
+                            "UPDATE comments SET is_hidden=TRUE WHERE id=@id",
+                            new() { ["@id"] = req.EntityId });
+                        break;
+                    // 'user' type: only flag, don't auto-ban — human review required
+                }
+            }
 
             return (true, "Report submit ho gayi. Hamari team 24 ghante mein review karegi. Shukriya!");
         }

@@ -1,6 +1,7 @@
 using HauntedVoiceUniverse.Common;
 using HauntedVoiceUniverse.Infrastructure.Database;
 using HauntedVoiceUniverse.Modules.Admin.Models;
+using HauntedVoiceUniverse.Modules.Notifications.Services;
 using Npgsql;
 using System.Text.Json;
 
@@ -63,15 +64,22 @@ public interface IAdminService
 
     // Support (Admin view)
     Task<PagedResult<AdminWithdrawalResponse>> GetAllTicketsAsync(string? status, int page, int pageSize);
+
+    // Platform Settings
+    Task<List<PlatformSettingResponse>> GetPlatformSettingsAsync();
+    Task<(bool Success, string Message)> UpdatePlatformSettingAsync(string key, string value);
 }
 
 public class AdminService : IAdminService
 {
     private readonly IDbConnectionFactory _db;
+    // BUG#M9-3 FIX: inject notification service to alert users about moderation actions.
+    private readonly INotificationService _notify;
 
-    public AdminService(IDbConnectionFactory db)
+    public AdminService(IDbConnectionFactory db, INotificationService notify)
     {
         _db = db;
+        _notify = notify;
     }
 
     private async Task LogAuditAsync(NpgsqlConnection conn, Guid adminId, string action,
@@ -100,7 +108,10 @@ public class AdminService : IAdminService
     public async Task<WarRoomResponse> GetWarRoomAsync()
     {
         using var conn = await _db.CreateConnectionAsync();
-        var today = DateTime.UtcNow.Date;
+        // BUG#A8 FIX: Use IST (UTC+5:30) midnight — platform is Indian
+        // UTC midnight = 5:30 AM IST which is wrong for "today's" stats
+        var istOffset = TimeSpan.FromHours(5.5);
+        var today = (DateTime.UtcNow + istOffset).Date - istOffset; // IST midnight in UTC
 
         var activeToday = await DbHelper.ExecuteScalarAsync<long>(conn,
             "SELECT COUNT(*) FROM users WHERE last_active_at >= @today", new Dictionary<string, object?> { ["today"] = today });
@@ -264,6 +275,16 @@ public class AdminService : IAdminService
             });
 
         await LogAuditAsync(conn, adminId, "ban_user", "user", userId, req.Reason);
+
+        // BUG#M9-3 FIX: Notify the user about the ban action.
+        var banTitle = req.ShadowBan ? "Account Warning" : (req.DurationHours.HasValue ? "Account Temporarily Suspended" : "Account Banned");
+        var banMsg   = req.ShadowBan
+            ? $"Aapki account activity review under hai. Reason: {req.Reason}"
+            : req.DurationHours.HasValue
+                ? $"Aapka account {req.DurationHours}h ke liye suspend ho gaya hai. Reason: {req.Reason}"
+                : $"Aapka account permanently ban ho gaya hai. Reason: {req.Reason}. Appeal ke liye support se contact karein.";
+        _ = _notify.CreateNotificationAsync(userId, "system", banTitle, banMsg);
+
         return (true, "User ban ho gaya");
     }
 
@@ -324,30 +345,48 @@ public class AdminService : IAdminService
     public async Task<(bool Success, string Message)> AddStrikeAsync(Guid adminId, Guid userId, AddStrikeRequest req)
     {
         using var conn = await _db.CreateConnectionAsync();
-        var strikeNum = await DbHelper.ExecuteScalarAsync<int>(conn,
-            "SELECT strike_count FROM users WHERE id = @id",
-            new Dictionary<string, object?> { ["id"] = userId });
-
-        if (strikeNum >= 3) return (false, "User ke pehle se 3 strikes hain. Ban karo.");
-
-        strikeNum++;
-        await DbHelper.ExecuteNonQueryAsync(conn,
-            "INSERT INTO user_strikes (user_id, issued_by, reason, strike_number, report_id) VALUES (@uid, @aid, @reason, @num, @rid)",
-            new Dictionary<string, object?> { ["uid"] = userId, ["aid"] = adminId, ["reason"] = req.Reason, ["num"] = strikeNum, ["rid"] = (object?)req.ReportId ?? DBNull.Value });
-
-        await DbHelper.ExecuteNonQueryAsync(conn,
-            "UPDATE users SET strike_count = @num, last_strike_at = NOW() WHERE id = @id",
-            new Dictionary<string, object?> { ["id"] = userId, ["num"] = strikeNum });
-
-        if (strikeNum >= 3)
+        // BUG#A6 FIX: Wrap in transaction with FOR UPDATE to prevent race condition
+        // where two concurrent admins both see strikeNum < 3 and both trigger auto-ban
+        using var tx = await conn.BeginTransactionAsync();
+        try
         {
-            await DbHelper.ExecuteNonQueryAsync(conn,
-                "UPDATE users SET status = 'banned', ban_reason = '3 strikes - auto ban' WHERE id = @id",
+            var strikeNum = await DbHelper.ExecuteScalarAsync<int>(conn,
+                "SELECT strike_count FROM users WHERE id = @id FOR UPDATE",
                 new Dictionary<string, object?> { ["id"] = userId });
-        }
 
-        await LogAuditAsync(conn, adminId, "add_strike", "user", userId, req.Reason);
-        return (true, $"Strike #{strikeNum} add ho gaya" + (strikeNum >= 3 ? " - User auto-ban ho gaya" : ""));
+            if (strikeNum >= 3) { await tx.RollbackAsync(); return (false, "User ke pehle se 3 strikes hain. Ban karo."); }
+
+            strikeNum++;
+            await DbHelper.ExecuteNonQueryAsync(conn,
+                "INSERT INTO user_strikes (user_id, issued_by, reason, strike_number, report_id) VALUES (@uid, @aid, @reason, @num, @rid)",
+                new Dictionary<string, object?> { ["uid"] = userId, ["aid"] = adminId, ["reason"] = req.Reason, ["num"] = strikeNum, ["rid"] = (object?)req.ReportId ?? DBNull.Value }, tx);
+
+            if (strikeNum >= 3)
+            {
+                await DbHelper.ExecuteNonQueryAsync(conn,
+                    "UPDATE users SET strike_count = @num, last_strike_at = NOW(), status = 'banned'::user_status, ban_reason = '3 strikes - auto ban' WHERE id = @id",
+                    new Dictionary<string, object?> { ["id"] = userId, ["num"] = strikeNum }, tx);
+            }
+            else
+            {
+                await DbHelper.ExecuteNonQueryAsync(conn,
+                    "UPDATE users SET strike_count = @num, last_strike_at = NOW() WHERE id = @id",
+                    new Dictionary<string, object?> { ["id"] = userId, ["num"] = strikeNum }, tx);
+            }
+
+            await tx.CommitAsync();
+            await LogAuditAsync(conn, adminId, "add_strike", "user", userId, req.Reason);
+
+            // BUG#M9-3 FIX: Notify user about their strike with the reason.
+            var strikeTitle = strikeNum >= 3 ? "⛔ Account Ban — 3 Strikes" : $"⚠️ Warning Strike #{strikeNum}";
+            var strikeMsg   = strikeNum >= 3
+                ? $"Aapko 3 strikes mil gayi hain aur aapka account ban ho gaya hai. Last reason: {req.Reason}"
+                : $"Aapko strike #{strikeNum} mili hai. Reason: {req.Reason}. 3 strikes pe permanent ban hoga.";
+            _ = _notify.CreateNotificationAsync(userId, "system", strikeTitle, strikeMsg);
+
+            return (true, $"Strike #{strikeNum} add ho gaya" + (strikeNum >= 3 ? " - User auto-ban ho gaya" : ""));
+        }
+        catch { await tx.RollbackAsync(); return (false, "Strike add karne mein error aaya"); }
     }
 
     public async Task<(bool Success, string Message)> RemoveStrikeAsync(Guid adminId, Guid strikeId, string reason)
@@ -508,14 +547,20 @@ public class AdminService : IAdminService
         parameters["offset"] = offset;
 
         var items = await DbHelper.ExecuteReaderAsync(conn,
+            // BUG#M9-8 FIX: Sort by severity DESC first, then by report count (unique reporters on
+            // the same entity) DESC so content with many reports surfaces before single-report items,
+            // then oldest-first so nothing is starved.
             $@"SELECT r.id, r.reporter_id, r.entity_type, r.entity_id, r.reason, r.custom_reason,
                       r.severity, r.status, r.created_at, r.reviewed_at, r.action_taken, r.resolution_note,
-                      u.username as reporter_username, rv.username as reviewed_by_username
+                      u.username as reporter_username, rv.username as reviewed_by_username,
+                      (SELECT COUNT(DISTINCT r2.reporter_id) FROM reports r2
+                       WHERE r2.entity_id = r.entity_id AND r2.entity_type = r.entity_type
+                         AND r2.status = 'pending') AS unique_reporter_count
                FROM reports r
                JOIN users u ON u.id = r.reporter_id
                LEFT JOIN users rv ON rv.id = r.reviewed_by
                WHERE {where}
-               ORDER BY r.severity DESC, r.created_at ASC
+               ORDER BY r.severity DESC, unique_reporter_count DESC, r.created_at ASC
                LIMIT @limit OFFSET @offset",
             r => new AdminReportResponse
             {
@@ -541,13 +586,16 @@ public class AdminService : IAdminService
     public async Task<(bool Success, string Message)> ResolveReportAsync(Guid adminId, Guid reportId, ResolveReportRequest req)
     {
         using var conn = await _db.CreateConnectionAsync();
+        // BUG#M9-9 FIX: Use a transaction + FOR UPDATE to prevent two moderators simultaneously
+        // resolving the same report, which would overwrite each other's action_taken/reviewed_by.
+        using var tx = await conn.BeginTransactionAsync();
 
         var report = await DbHelper.ExecuteReaderFirstAsync(conn,
-            "SELECT id, entity_id, entity_type, reporter_id FROM reports WHERE id = @id AND status = 'pending'",
+            "SELECT id, entity_id, entity_type, reporter_id FROM reports WHERE id = @id AND status = 'pending' FOR UPDATE",
             r => new { Id = DbHelper.GetGuid(r, "id"), EntityId = DbHelper.GetGuid(r, "entity_id"), EntityType = DbHelper.GetString(r, "entity_type"), ReporterId = DbHelper.GetGuid(r, "reporter_id") },
-            new Dictionary<string, object?> { ["id"] = reportId });
+            new Dictionary<string, object?> { ["id"] = reportId }, tx);
 
-        if (report == null) return (false, "Report nahi mila ya pehle se resolved hai");
+        if (report == null) { await tx.RollbackAsync(); return (false, "Report nahi mila ya pehle se resolved hai"); }
 
         await DbHelper.ExecuteNonQueryAsync(conn,
             @"UPDATE reports SET status = @status::report_status, reviewed_by = @aid, reviewed_at = NOW(),
@@ -559,7 +607,7 @@ public class AdminService : IAdminService
                 ["action"] = (object?)req.ModerationAction ?? DBNull.Value,
                 ["note"] = (object?)req.ResolutionNote ?? DBNull.Value,
                 ["id"] = reportId
-            });
+            }, tx);
 
         // Apply moderation action if specified
         if (!string.IsNullOrEmpty(req.ModerationAction))
@@ -574,10 +622,52 @@ public class AdminService : IAdminService
                     ["action"] = req.ModerationAction, ["et"] = report.EntityType,
                     ["eid"] = report.EntityId, ["reason"] = req.ResolutionNote ?? req.ModerationAction,
                     ["rid"] = reportId
-                });
+                }, tx);
         }
 
+        await tx.CommitAsync(); // BUG#M9-9 FIX: commit the locked transaction
         await LogAuditAsync(conn, adminId, "resolve_report", "report", reportId, req.ResolutionNote);
+
+        // BUG#M9-3 FIX: Notify the owner of the reported content about the moderation outcome
+        // (TC27). We notify the entity owner — for story/episode/comment we look up the owner_id.
+        // For 'user' type, entity_id IS the userId. Only notify when an actual moderation action was taken.
+        if (!string.IsNullOrEmpty(req.ModerationAction) && req.ModerationAction != "no_action")
+        {
+            Guid notifyTargetId = default;
+            switch (report.EntityType)
+            {
+                case "user":
+                    notifyTargetId = report.EntityId;
+                    break;
+                case "story":
+                case "episode":
+                    try {
+                        using var nc = await _db.CreateConnectionAsync();
+                        var cid = await DbHelper.ExecuteScalarAsync<Guid?>(nc,
+                            "SELECT creator_id FROM stories WHERE id=@id",
+                            new() { ["@id"] = report.EntityId });
+                        if (cid.HasValue) notifyTargetId = cid.Value;
+                    } catch { }
+                    break;
+                case "comment":
+                    try {
+                        using var nc = await _db.CreateConnectionAsync();
+                        var uid = await DbHelper.ExecuteScalarAsync<Guid?>(nc,
+                            "SELECT user_id FROM comments WHERE id=@id",
+                            new() { ["@id"] = report.EntityId });
+                        if (uid.HasValue) notifyTargetId = uid.Value;
+                    } catch { }
+                    break;
+            }
+            if (notifyTargetId != default)
+            {
+                var actionNote = req.ResolutionNote ?? req.ModerationAction;
+                _ = _notify.CreateNotificationAsync(notifyTargetId, "system",
+                    "Moderation Action Taken",
+                    $"Aapke content pe ek report ke baad moderation action liya gaya: {req.ModerationAction}. Note: {actionNote}");
+            }
+        }
+
         return (true, "Report resolve ho gaya");
     }
 
@@ -638,11 +728,24 @@ public class AdminService : IAdminService
         try
         {
             var wd = await DbHelper.ExecuteReaderFirstAsync(conn,
-                "SELECT id, user_id, coin_amount, status FROM withdrawals WHERE id = @id AND status = 'pending' FOR UPDATE",
-                r => new { Id = DbHelper.GetGuid(r, "id"), UserId = DbHelper.GetGuid(r, "user_id"), CoinAmount = DbHelper.GetLong(r, "coin_amount") },
+                @"SELECT w.id, w.user_id, w.coin_amount, w.status, u.status AS user_status
+                  FROM withdrawals w
+                  JOIN users u ON u.id = w.user_id
+                  WHERE w.id = @id AND w.status = 'pending' FOR UPDATE",
+                r => new
+                {
+                    Id         = DbHelper.GetGuid(r, "id"),
+                    UserId     = DbHelper.GetGuid(r, "user_id"),
+                    CoinAmount = DbHelper.GetLong(r, "coin_amount"),
+                    UserStatus = DbHelper.GetString(r, "user_status"),
+                },
                 new Dictionary<string, object?> { ["id"] = withdrawalId });
 
             if (wd == null) return (false, "Withdrawal nahi mila ya pending nahi hai");
+
+            // BUG#9 FIX: Block payout if user is banned — admin must manually reject
+            if (wd.UserStatus != "active")
+                return (false, $"User ka account '{wd.UserStatus}' hai. Withdrawal approve nahi ho sakta. Pehle reject karein.");
 
             await DbHelper.ExecuteNonQueryAsync(conn,
                 "UPDATE withdrawals SET status = 'completed', processed_by = @aid, processed_at = NOW(), transaction_reference = @ref WHERE id = @id",
@@ -653,8 +756,13 @@ public class AdminService : IAdminService
                 "UPDATE wallets SET pending_withdrawal = GREATEST(pending_withdrawal - @amount, 0), total_withdrawn = total_withdrawn + @amount, updated_at = NOW() WHERE user_id = @uid",
                 new Dictionary<string, object?> { ["uid"] = wd.UserId, ["amount"] = wd.CoinAmount }, tx);
 
+            // BUG#14 FIX: Audit log INSIDE transaction — atomically committed with the approval
+            await DbHelper.ExecuteNonQueryAsync(conn,
+                @"INSERT INTO admin_audit_log (admin_id, action, entity_type, entity_id, description)
+                  VALUES (@aid, 'approve_withdrawal', 'withdrawal', @eid, 'Withdrawal approved')",
+                new Dictionary<string, object?> { ["aid"] = adminId, ["eid"] = withdrawalId }, tx);
+
             await tx.CommitAsync();
-            await LogAuditAsync(conn, adminId, "approve_withdrawal", "withdrawal", withdrawalId);
             return (true, "Withdrawal approve ho gayi");
         }
         catch { await tx.RollbackAsync(); return (false, "Error aaya"); }
@@ -682,8 +790,13 @@ public class AdminService : IAdminService
                 "UPDATE wallets SET coin_balance = coin_balance + @amount, pending_withdrawal = GREATEST(pending_withdrawal - @amount, 0), updated_at = NOW() WHERE user_id = @uid",
                 new Dictionary<string, object?> { ["uid"] = wd.UserId, ["amount"] = wd.CoinAmount }, tx);
 
+            // BUG#A7 FIX: Audit log INSIDE transaction — atomically committed with the rejection
+            await DbHelper.ExecuteNonQueryAsync(conn,
+                @"INSERT INTO admin_audit_log (admin_id, action, entity_type, entity_id, description)
+                  VALUES (@aid, 'reject_withdrawal', 'withdrawal', @eid, @reason)",
+                new Dictionary<string, object?> { ["aid"] = adminId, ["eid"] = withdrawalId, ["reason"] = req.Reason }, tx);
+
             await tx.CommitAsync();
-            await LogAuditAsync(conn, adminId, "reject_withdrawal", "withdrawal", withdrawalId, req.Reason);
             return (true, "Withdrawal reject ho gayi, coins refund ho gaye");
         }
         catch { await tx.RollbackAsync(); return (false, "Error aaya"); }
@@ -829,8 +942,11 @@ public class AdminService : IAdminService
     public async Task<PlatformAnalyticsResponse> GetAnalyticsAsync()
     {
         using var conn = await _db.CreateConnectionAsync();
-        var today = DateTime.UtcNow.Date;
-        var monthStart = new DateTime(today.Year, today.Month, 1);
+        // BUG#A8 FIX: Use IST (UTC+5:30) midnight for DAU/MAU calculations
+        var istOffset = TimeSpan.FromHours(5.5);
+        var todayIst = (DateTime.UtcNow + istOffset).Date;
+        var today = todayIst - istOffset; // IST midnight in UTC
+        var monthStart = new DateTime(todayIst.Year, todayIst.Month, 1) - istOffset;
 
         var totalUsers = await DbHelper.ExecuteScalarAsync<long>(conn, "SELECT COUNT(*) FROM users WHERE deleted_at IS NULL");
         var totalCreators = await DbHelper.ExecuteScalarAsync<long>(conn, "SELECT COUNT(*) FROM users WHERE is_creator = TRUE");
@@ -880,5 +996,82 @@ public class AdminService : IAdminService
     {
         // Placeholder - tickets are managed in Support module
         return PagedResult<AdminWithdrawalResponse>.Create(new(), 0, page, pageSize);
+    }
+
+    // ─── PLATFORM SETTINGS ────────────────────────────────────────────────────
+
+    public async Task<List<PlatformSettingResponse>> GetPlatformSettingsAsync()
+    {
+        using var conn = await _db.CreateConnectionAsync();
+
+        // Auto-create table if not exists
+        await DbHelper.ExecuteNonQueryAsync(conn,
+            @"CREATE TABLE IF NOT EXISTS platform_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT '',
+                description TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )");
+
+        // Ensure default settings exist
+        var defaults = new Dictionary<string, (string Value, string Desc)>
+        {
+            ["referral_coins"]        = ("100",  "Coins awarded to referrer when someone uses their code"),
+            ["signup_bonus_coins"]    = ("50",   "Coins given to new users on signup"),
+            ["creator_welcome_coins"] = ("100",  "Coins given when user becomes creator"),
+        };
+
+        foreach (var kv in defaults)
+        {
+            await DbHelper.ExecuteNonQueryAsync(conn,
+                @"INSERT INTO platform_settings (key, value, description, updated_at)
+                  VALUES (@key, @val, @desc, NOW())
+                  ON CONFLICT (key) DO NOTHING",
+                new Dictionary<string, object?> { ["@key"] = kv.Key, ["@val"] = kv.Value.Value, ["@desc"] = kv.Value.Desc });
+        }
+
+        return await DbHelper.ExecuteReaderAsync(conn,
+            "SELECT key, value, description, updated_at FROM platform_settings ORDER BY key",
+            r => new PlatformSettingResponse
+            {
+                Key         = DbHelper.GetString(r, "key"),
+                Value       = DbHelper.GetString(r, "value"),
+                Description = DbHelper.GetStringOrNull(r, "description"),
+                UpdatedAt   = DbHelper.GetDateTime(r, "updated_at")
+            });
+    }
+
+    // BUG#A9 FIX: Allowlist of known numeric keys + positive integer validation
+    private static readonly HashSet<string> _allowedSettingKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "referral_coins", "signup_bonus_coins", "creator_welcome_coins",
+        "min_withdrawal_coins", "max_withdrawal_coins", "coin_to_inr_rate",
+        "daily_appreciation_limit", "super_chat_min_coins", "super_chat_max_coins",
+        "leaderboard_reward_pool", "daily_signup_limit",
+    };
+
+    public async Task<(bool Success, string Message)> UpdatePlatformSettingAsync(string key, string value)
+    {
+        // Only allow updating keys from the known allowlist
+        if (!_allowedSettingKeys.Contains(key))
+            return (false, $"Unknown setting key '{key}'. Allowed: {string.Join(", ", _allowedSettingKeys)}");
+
+        // All current settings are positive integers — enforce that
+        if (!long.TryParse(value, out var numVal) || numVal < 0)
+            return (false, $"Invalid value '{value}'. Setting must be a non-negative integer.");
+
+        using var conn = await _db.CreateConnectionAsync();
+        var rows = await DbHelper.ExecuteNonQueryAsync(conn,
+            "UPDATE platform_settings SET value = @val, updated_at = NOW() WHERE key = @key",
+            new Dictionary<string, object?> { ["@key"] = key, ["@val"] = value });
+
+        if (rows == 0)
+        {
+            await DbHelper.ExecuteNonQueryAsync(conn,
+                "INSERT INTO platform_settings (key, value, updated_at) VALUES (@key, @val, NOW()) ON CONFLICT (key) DO UPDATE SET value = @val, updated_at = NOW()",
+                new Dictionary<string, object?> { ["@key"] = key, ["@val"] = value });
+        }
+
+        return (true, $"Setting '{key}' updated to '{value}'.");
     }
 }

@@ -109,7 +109,7 @@ public class UsersController : ControllerBase
     }
 
     // ─── DELETE ACCOUNT ───────────────────────────────────────────────────────
-    /// <summary>Account delete karo (soft delete)</summary>
+    /// <summary>Account delete karo — DPDP Act 2023 compliant PII erasure</summary>
     [HttpDelete("me")]
     [Authorize]
     public async Task<IActionResult> DeleteAccount()
@@ -119,6 +119,56 @@ public class UsersController : ControllerBase
             return BadRequest(ApiResponse<object>.Fail(message));
 
         return Ok(ApiResponse<object>.Ok(null, message));
+    }
+
+    // VULN#20 FIX (DPDP Act 2023 — Right to Access, Section 11):
+    // Users have the right to receive a copy of their personal data.
+    // This endpoint returns all PII held about the requesting user in a portable format.
+    /// <summary>Apna personal data download karo (DPDP Act 2023 — Right to Access)</summary>
+    [HttpGet("me/data-export")]
+    [Authorize]
+    public async Task<IActionResult> ExportMyData()
+    {
+        var profile = await _userService.GetMyProfileAsync(RequiredUserId);
+        if (profile == null) return NotFound(ApiResponse<object>.Fail("User nahi mila"));
+
+        // Return a structured export. In production this should be queued as a background
+        // job and emailed to the user's verified address to prevent account enumeration.
+        var export = new
+        {
+            exported_at = DateTime.UtcNow,
+            dpdp_notice = "DPDP Act 2023 Section 11 — Right to Access Personal Data",
+            personal_data = new
+            {
+                profile.Id,
+                profile.Username,
+                profile.Email,
+                profile.DisplayName,
+                profile.Bio,
+                profile.Phone,
+                profile.Gender,
+                profile.DateOfBirth,
+                profile.State,
+                profile.City,
+                profile.Pincode,
+                profile.PreferredLanguage,
+                profile.CreatedAt,
+                profile.LastActiveAt,
+            },
+            activity_summary = new
+            {
+                profile.TotalFollowers,
+                profile.TotalFollowing,
+                profile.TotalStoriesPublished,
+                profile.TotalViewsReceived,
+                profile.LoginStreak,
+                profile.MaxLoginStreak,
+                profile.TotalReadingTimeMinutes,
+                profile.TotalReferrals,
+            }
+        };
+
+        return Ok(ApiResponse<object>.Ok(export, "Aapka personal data. Yeh DPDP Act 2023 ke Section 11 ke antargat provide kiya gaya hai."));
     }
 
     // ─── FOLLOW ───────────────────────────────────────────────────────────────
@@ -197,6 +247,42 @@ public class UsersController : ControllerBase
             return BadRequest(ApiResponse<object>.Fail(message));
 
         return Ok(ApiResponse<object>.Ok(null, message));
+    }
+
+    // ─── BECOME CREATOR ───────────────────────────────────────────────────────
+    /// <summary>Creator ban jao (onboarding flow)</summary>
+    [HttpPost("me/become-creator")]
+    [Authorize]
+    public async Task<IActionResult> BecomeCreator()
+    {
+        var (success, message, coinsAwarded) = await _userService.BecomeCreatorAsync(RequiredUserId);
+        if (!success)
+            return BadRequest(ApiResponse<object>.Fail(message));
+
+        return Ok(ApiResponse<object>.Ok(new { coins_awarded = coinsAwarded }, message));
+    }
+
+    // ─── COMPLETE ONBOARDING ──────────────────────────────────────────────────
+    /// <summary>Onboarding complete mark karo (reader path)</summary>
+    [HttpPost("me/complete-onboarding")]
+    [Authorize]
+    public async Task<IActionResult> CompleteOnboarding()
+    {
+        var (success, message) = await _userService.CompleteOnboardingAsync(RequiredUserId);
+        if (!success)
+            return BadRequest(ApiResponse<object>.Fail(message));
+
+        return Ok(ApiResponse<object>.Ok(null, message));
+    }
+
+    // ─── GET REFERRAL STATS ───────────────────────────────────────────────────
+    /// <summary>Apni referral stats aur referred users list dekho</summary>
+    [HttpGet("me/referrals")]
+    [Authorize]
+    public async Task<IActionResult> GetMyReferrals()
+    {
+        var stats = await _userService.GetReferralStatsAsync(RequiredUserId);
+        return Ok(ApiResponse<ReferralStatsResponse>.Ok(stats));
     }
 
     // ─── GET BLOCKED USERS ────────────────────────────────────────────────────

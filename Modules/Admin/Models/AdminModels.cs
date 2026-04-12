@@ -285,3 +285,19 @@ public class ApproveCreatorRequest
 {
     public bool EnableMonetization { get; set; } = false;
 }
+
+// ─── PLATFORM SETTINGS ────────────────────────────────────────────────────────
+
+public class PlatformSettingResponse
+{
+    public string Key { get; set; } = "";
+    public string Value { get; set; } = "";
+    public string? Description { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+
+public class UpdatePlatformSettingRequest
+{
+    [Required]
+    public string Value { get; set; } = "";
+}

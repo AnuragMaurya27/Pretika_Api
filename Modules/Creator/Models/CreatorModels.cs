@@ -38,12 +38,18 @@ public class CreatorStatsResponse
     public string? NextRankName { get; set; }
     public double MilestoneProgress { get; set; }
 
+    // ── Revenue Breakdown (extended) ─────────────────────────────────────────
+    // BUG#M5-3 FIX: PremiumUnlockEarnings was missing entirely from this response.
+    public long PremiumUnlockEarnings { get; set; }
+
     // ── Content Stats ─────────────────────────────────────────────────────────
     public int StoriesCount { get; set; }
     public int PublishedStoriesCount { get; set; }
     public int TotalEpisodesCount { get; set; }
     public long TotalViews { get; set; }
     public long TotalLikes { get; set; }
+    // BUG#M5-4 FIX: TotalComments was missing — Flutter was always showing 0 for Comments.
+    public long TotalComments { get; set; }
 
     // ── Social ────────────────────────────────────────────────────────────────
     public int FollowersCount { get; set; }

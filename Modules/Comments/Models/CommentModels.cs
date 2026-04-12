@@ -26,6 +26,9 @@ public class CommentResponse
     // Viewer context
     public bool IsLikedByMe { get; set; }
     public bool IsMyComment { get; set; }
+
+    // The rating this user gave the story (1-5, null if not rated)
+    public int? UserRating { get; set; }
 }
 
 public class CreateCommentRequest

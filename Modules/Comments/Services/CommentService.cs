@@ -1,6 +1,7 @@
 using HauntedVoiceUniverse.Common;
 using HauntedVoiceUniverse.Infrastructure.Database;
 using HauntedVoiceUniverse.Modules.Comments.Models;
+using HauntedVoiceUniverse.Modules.Notifications.Services;
 using Npgsql;
 
 namespace HauntedVoiceUniverse.Modules.Comments.Services;
@@ -21,10 +22,12 @@ public interface ICommentService
 public class CommentService : ICommentService
 {
     private readonly IDbConnectionFactory _db;
+    private readonly INotificationService _notifications;
 
-    public CommentService(IDbConnectionFactory db)
+    public CommentService(IDbConnectionFactory db, INotificationService notifications)
     {
         _db = db;
+        _notifications = notifications;
     }
 
     private static CommentResponse MapComment(NpgsqlDataReader r, Guid? viewerId)
@@ -48,7 +51,8 @@ public class CommentService : ICommentService
             AuthorAvatarUrl = DbHelper.GetStringOrNull(r, "avatar_url"),
             AuthorIsCreator = DbHelper.GetBool(r, "author_is_creator"),
             IsLikedByMe = DbHelper.GetBool(r, "is_liked_by_me"),
-            IsMyComment = viewerId.HasValue && DbHelper.GetGuid(r, "user_id") == viewerId.Value
+            IsMyComment = viewerId.HasValue && DbHelper.GetGuid(r, "user_id") == viewerId.Value,
+            UserRating = r.IsDBNull(r.GetOrdinal("user_rating")) ? null : (int?)r.GetInt32(r.GetOrdinal("user_rating"))
         };
     }
 
@@ -66,10 +70,12 @@ public class CommentService : ICommentService
                    c.likes_count, c.replies_count, c.is_pinned, c.is_creator_reply,
                    c.created_at, c.updated_at, c.user_id,
                    u.username, u.display_name, u.avatar_url, u.is_creator as author_is_creator,
-                   CASE WHEN cl.id IS NOT NULL THEN TRUE ELSE FALSE END as is_liked_by_me
+                   CASE WHEN cl.id IS NOT NULL THEN TRUE ELSE FALSE END as is_liked_by_me,
+                   sr.rating as user_rating
             FROM comments c
             JOIN users u ON u.id = c.user_id
             LEFT JOIN comment_likes cl ON cl.comment_id = c.id AND cl.user_id = @viewerId
+            LEFT JOIN story_ratings sr ON sr.user_id = c.user_id AND sr.story_id = c.story_id
             WHERE c.story_id = @storyId AND c.parent_comment_id IS NULL
               AND c.deleted_at IS NULL AND c.is_hidden = FALSE
             ORDER BY c.is_pinned DESC, c.created_at DESC
@@ -101,10 +107,12 @@ public class CommentService : ICommentService
                    c.likes_count, c.replies_count, c.is_pinned, c.is_creator_reply,
                    c.created_at, c.updated_at, c.user_id,
                    u.username, u.display_name, u.avatar_url, u.is_creator as author_is_creator,
-                   CASE WHEN cl.id IS NOT NULL THEN TRUE ELSE FALSE END as is_liked_by_me
+                   CASE WHEN cl.id IS NOT NULL THEN TRUE ELSE FALSE END as is_liked_by_me,
+                   sr.rating as user_rating
             FROM comments c
             JOIN users u ON u.id = c.user_id
             LEFT JOIN comment_likes cl ON cl.comment_id = c.id AND cl.user_id = @viewerId
+            LEFT JOIN story_ratings sr ON sr.user_id = c.user_id AND sr.story_id = c.story_id
             WHERE c.parent_comment_id = @commentId
               AND c.deleted_at IS NULL AND c.is_hidden = FALSE
             ORDER BY c.created_at ASC
@@ -150,6 +158,38 @@ public class CommentService : ICommentService
                 new Dictionary<string, object?> { ["storyId"] = req.StoryId, ["userId"] = userId });
         }
 
+        // BUG#M9-5 FIX: Duplicate/spam comment filter.
+        // (a) Same user same content on same story within 5 minutes → reject.
+        var isDuplicate = await DbHelper.ExecuteScalarAsync<bool>(conn,
+            @"SELECT EXISTS(
+                SELECT 1 FROM comments
+                WHERE user_id = @userId AND story_id = @storyId
+                  AND LOWER(content) = LOWER(@content)
+                  AND deleted_at IS NULL
+                  AND created_at > NOW() - INTERVAL '5 minutes'
+              )",
+            new Dictionary<string, object?>
+            {
+                ["userId"] = userId, ["storyId"] = req.StoryId, ["content"] = req.Content
+            });
+        if (isDuplicate) return (false, "Duplicate comment nahi kar sakte. 5 minute baad try karo.", null);
+
+        // (b) Same user posted ≥5 comments on same story in last 2 minutes → spam rate limit.
+        var recentCount = await DbHelper.ExecuteScalarAsync<int>(conn,
+            @"SELECT COUNT(1) FROM comments
+              WHERE user_id = @userId AND story_id = @storyId
+                AND deleted_at IS NULL
+                AND created_at > NOW() - INTERVAL '2 minutes'",
+            new Dictionary<string, object?> { ["userId"] = userId, ["storyId"] = req.StoryId });
+        if (recentCount >= 5)
+            return (false, "Bahut zyada comments. 2 minute ruko.", null);
+
+        // (c) URL/link spam — reject if comment contains more than 2 URLs.
+        var urlCount = System.Text.RegularExpressions.Regex.Matches(
+            req.Content, @"https?://\S+", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Count;
+        if (urlCount > 2)
+            return (false, "Comment mein zyada links allowed nahi hain.", null);
+
         var id = Guid.NewGuid();
         await DbHelper.ExecuteNonQueryAsync(conn,
             @"INSERT INTO comments (id, user_id, story_id, episode_id, parent_comment_id, content, is_creator_reply)
@@ -184,13 +224,48 @@ public class CommentService : ICommentService
                    c.likes_count, c.replies_count, c.is_pinned, c.is_creator_reply,
                    c.created_at, c.updated_at, c.user_id,
                    u.username, u.display_name, u.avatar_url, u.is_creator as author_is_creator,
-                   FALSE as is_liked_by_me
+                   FALSE as is_liked_by_me,
+                   sr.rating as user_rating
             FROM comments c
             JOIN users u ON u.id = c.user_id
+            LEFT JOIN story_ratings sr ON sr.user_id = c.user_id AND sr.story_id = c.story_id
             WHERE c.id = @id";
 
         var comment = await DbHelper.ExecuteReaderFirstAsync(conn, sql, r => MapComment(r, userId),
             new Dictionary<string, object?> { ["id"] = id });
+
+        // Notify story owner (skip if commenter IS the owner, and skip for replies)
+        if (comment != null && !req.ParentCommentId.HasValue)
+        {
+            try
+            {
+                var storyInfo = await DbHelper.ExecuteReaderFirstAsync(conn,
+                    "SELECT creator_id, title FROM stories WHERE id = @sid",
+                    r => new { CreatorId = DbHelper.GetGuid(r, "creator_id"), Title = DbHelper.GetString(r, "title") },
+                    new Dictionary<string, object?> { ["sid"] = req.StoryId });
+
+                if (storyInfo != null && storyInfo.CreatorId != userId)
+                {
+                    var preview = req.Content.Length > 40
+                        ? req.Content[..40] + "..."
+                        : req.Content;
+                    var commenterName = comment.AuthorDisplayName?.Length > 0
+                        ? comment.AuthorDisplayName
+                        : comment.AuthorUsername;
+                    await _notifications.CreateNotificationAsync(
+                        userId: storyInfo.CreatorId,
+                        type: "new_comment",
+                        title: "Naya Comment! 💬",
+                        message: $"@{comment.AuthorUsername} ne tumhari story '{storyInfo.Title}' par comment kiya: \"{preview}\"",
+                        actorId: userId,
+                        actionUrl: $"/story/{req.StoryId}/comments");
+                }
+            }
+            catch
+            {
+                // Notification failure should not break comment creation
+            }
+        }
 
         return (true, "Comment add ho gaya", comment);
     }

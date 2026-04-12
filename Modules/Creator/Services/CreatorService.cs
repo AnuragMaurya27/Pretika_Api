@@ -29,18 +29,22 @@ public class CreatorService : ICreatorService
     }
 
     // ── Fear Rank Logic ──────────────────────────────────────────────────────
-    private static readonly (long MinScore, long NextScore, string Name, string Icon, int Level)[] FearRanks = new[]
+    // BUG#M6-1 FIX: Ranks were 7 English-named ranks ("Rookie Haunter" etc.) but
+    // Flutter rank_constants.dart defines 6 Hindi named ranks. They must match exactly
+    // so creatorRankMeta(key) lookups succeed in Flutter. Also added snake_case Key field.
+    private static readonly (long MinScore, long NextScore, string Name, string Key, string Icon, int Level)[] FearRanks = new[]
     {
-        (0L,       500L,       "Rookie Haunter",     "👤", 1),
-        (500L,     2000L,      "Shadow Walker",      "🌑", 2),
-        (2000L,    10000L,     "Ghost Whisperer",    "👻", 3),
-        (10000L,   50000L,     "Spirit Master",      "🧿", 4),
-        (50000L,   200000L,    "Shadow Weaver",      "🕸️", 5),
-        (200000L,  1000000L,   "Demon Lord",         "😈", 6),
-        (1000000L, long.MaxValue, "Supreme Harbinger","💀", 7),
+        (0L,        500L,          "Pret Aatma",            "pret_aatma",            "👻", 1),
+        (500L,      2000L,         "Shraapit Lekhak",       "shraapit_lekhak",       "📜", 2),
+        (2000L,     10000L,        "Andhkaar Rachnakar",    "andhkaar_rachnakar",    "🌑", 3),
+        (10000L,    50000L,        "Bhoot Samrat",          "bhoot_samrat",          "👑", 4),
+        (50000L,    200000L,       "Tantrik Master",        "tantrik_master",        "🔮", 5),
+        (200000L,   long.MaxValue, "Mahakaal Katha Samrat", "mahakaal_katha_samrat", "💀", 6),
     };
 
-    private static (string Name, string Icon, int Level, long MinScore, long NextScore, string? NextRankName, double Progress)
+    // BUG#M6-1 FIX: Return type now includes Key (snake_case) so Flutter can look up
+    // the rank by key instead of receiving a display-name string it cannot match.
+    private static (string Name, string Key, string Icon, int Level, long MinScore, long NextScore, string? NextRankName, double Progress)
         GetFearRank(long score)
     {
         for (int i = 0; i < FearRanks.Length; i++)
@@ -51,10 +55,10 @@ public class CreatorService : ICreatorService
                 string? nextName = (i + 1 < FearRanks.Length) ? FearRanks[i + 1].Name : null;
                 double progress = r.NextScore == long.MaxValue ? 100.0
                     : Math.Min(100.0, (score - r.MinScore) * 100.0 / (r.NextScore - r.MinScore));
-                return (r.Name, r.Icon, r.Level, r.MinScore, r.NextScore, nextName, progress);
+                return (r.Name, r.Key, r.Icon, r.Level, r.MinScore, r.NextScore, nextName, progress);
             }
         }
-        return ("Supreme Harbinger", "💀", 7, 1000000L, long.MaxValue, null, 100.0);
+        return ("Mahakaal Katha Samrat", "mahakaal_katha_samrat", "💀", 6, 200000L, long.MaxValue, null, 100.0);
     }
 
     // ── Creator Tier Logic ───────────────────────────────────────────────────
@@ -73,18 +77,22 @@ public class CreatorService : ICreatorService
     // ── Main Stats Query ─────────────────────────────────────────────────────
     public async Task<(bool Success, string Message, CreatorStatsResponse? Data)> GetStatsAsync(Guid userId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M5-5 FIX: Use await using for proper async disposal of NpgsqlConnection.
+        await using var conn = await _db.CreateConnectionAsync();
 
         // 1. Story stats
+        // BUG#M5-1 FIX: Added deleted_at IS NULL — soft-deleted stories must not count
+        // in any aggregated stats. Without this, deleted content inflated totals.
         var storyStats = await DbHelper.ExecuteReaderFirstAsync(conn,
             @"SELECT
                 COUNT(*)                                     AS total_stories,
                 COUNT(*) FILTER (WHERE status = 'published') AS published_stories,
                 COALESCE(SUM(total_views), 0)               AS total_views,
                 COALESCE(SUM(total_likes), 0)               AS total_likes,
-                COALESCE(SUM(total_episodes), 0)            AS total_episodes
+                COALESCE(SUM(total_episodes), 0)            AS total_episodes,
+                COALESCE(SUM(total_comments), 0)            AS total_comments
               FROM stories
-              WHERE creator_id = @uid",
+              WHERE creator_id = @uid AND deleted_at IS NULL",
             r => new
             {
                 TotalStories    = (int)DbHelper.GetLong(r, "total_stories"),
@@ -92,14 +100,16 @@ public class CreatorService : ICreatorService
                 TotalViews      = DbHelper.GetLong(r, "total_views"),
                 TotalLikes      = DbHelper.GetLong(r, "total_likes"),
                 TotalEpisodes   = (int)DbHelper.GetLong(r, "total_episodes"),
+                TotalComments   = DbHelper.GetLong(r, "total_comments"),
             },
             new Dictionary<string, object?> { ["uid"] = userId });
 
         // 2. Top story
+        // BUG#M5-1 FIX: Also guard top story against deleted stories.
         var topStory = await DbHelper.ExecuteReaderFirstAsync(conn,
             @"SELECT id, title, slug, total_views, total_likes, thumbnail_url
               FROM stories
-              WHERE creator_id = @uid AND status = 'published'
+              WHERE creator_id = @uid AND status = 'published' AND deleted_at IS NULL
               ORDER BY total_views DESC
               LIMIT 1",
             r => new TopStoryInfo
@@ -161,6 +171,8 @@ public class CreatorService : ICreatorService
             new Dictionary<string, object?> { ["uid"] = userId });
 
         // 6. This-month earnings
+        // BUG#M5-2 FIX: Use IST (Asia/Kolkata = UTC+5:30) month boundary, not UTC.
+        // date_trunc('month', NOW()) resets at 18:30 UTC = wrong month for Indian creators.
         var thisMonthEarnings = await DbHelper.ExecuteScalarAsync<long>(conn,
             @"SELECT COALESCE(SUM(
                 CASE
@@ -172,45 +184,114 @@ public class CreatorService : ICreatorService
               FROM coin_transactions
               WHERE receiver_id = @uid AND status = 'completed'
                 AND transaction_type NOT IN ('recharge')
-                AND date_trunc('month', COALESCE(completed_at, created_at)) = date_trunc('month', NOW())",
+                AND date_trunc('month', COALESCE(completed_at, created_at) AT TIME ZONE 'Asia/Kolkata')
+                  = date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata')",
             new Dictionary<string, object?> { ["uid"] = userId });
 
-        // 7. Monthly views (from story_views joined to creator's stories)
+        // BUG#M5-3 FIX: Premium unlock revenue was completely missing from stats.
+        // episode_unlocks.coins_spent holds what readers paid for locked episodes
+        // and this never appeared in coin_transactions for the creator.
+        var premiumUnlockEarnings = await DbHelper.ExecuteReaderFirstAsync(conn,
+            @"SELECT
+                COALESCE(SUM(eu.coins_spent), 0)::bigint AS total_coins,
+                COALESCE(SUM(CASE
+                  WHEN date_trunc('month', eu.unlocked_at AT TIME ZONE 'Asia/Kolkata')
+                     = date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata')
+                  THEN eu.coins_spent ELSE 0 END), 0)::bigint AS this_month_coins
+              FROM episode_unlocks eu
+              JOIN episodes e ON e.id = eu.episode_id AND e.deleted_at IS NULL
+              JOIN stories s  ON s.id  = e.story_id  AND s.deleted_at IS NULL
+              WHERE s.creator_id = @uid",
+            r => new
+            {
+                Total      = DbHelper.GetLong(r, "total_coins"),
+                ThisMonth  = DbHelper.GetLong(r, "this_month_coins"),
+            },
+            new Dictionary<string, object?> { ["uid"] = userId });
+
+        // 7. Monthly views + unique readers (from story_views joined to creator's stories)
         long thisMonthViews = 0;
+        long uniqueReaders = 0;
         try
         {
+            // BUG#M5-2 FIX: IST month boundary for monthly views
             thisMonthViews = await DbHelper.ExecuteScalarAsync<long>(conn,
                 @"SELECT COUNT(*)
                   FROM story_views sv
-                  JOIN stories s ON s.id = sv.story_id
+                  JOIN stories s ON s.id = sv.story_id AND s.deleted_at IS NULL
                   WHERE s.creator_id = @uid
-                    AND sv.viewed_at >= date_trunc('month', NOW())",
+                    AND sv.viewed_at >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'",
+                new Dictionary<string, object?> { ["uid"] = userId });
+
+            // BUG#M6-2 FIX: Unique readers needed for 7-factor fear score algorithm.
+            // COUNT DISTINCT authenticated readers across all creator's published stories.
+            uniqueReaders = await DbHelper.ExecuteScalarAsync<long>(conn,
+                @"SELECT COUNT(DISTINCT sv.user_id)
+                  FROM story_views sv
+                  JOIN stories s ON s.id = sv.story_id AND s.deleted_at IS NULL
+                  WHERE s.creator_id = @uid AND sv.user_id IS NOT NULL",
                 new Dictionary<string, object?> { ["uid"] = userId });
         }
         catch { /* story_views table might not exist in some environments */ }
 
         // ── Compute derived values ────────────────────────────────────────────
-        long totalViews  = storyStats?.TotalViews ?? 0;
-        long totalLikes  = storyStats?.TotalLikes ?? 0;
-        long fearScore   = totalViews + (totalLikes * 10) + (followers * 20);
+        long totalViews    = storyStats?.TotalViews    ?? 0;
+        long totalLikes    = storyStats?.TotalLikes    ?? 0;
+        long totalComments = storyStats?.TotalComments ?? 0;
 
-        var (rankName, rankIcon, rankLevel, rankMin, rankNext, nextRankName, rankProgress) = GetFearRank(fearScore);
+        // Coins received from readers (appreciation + super_chat)
+        long coinsReceived = (earnings?.Appreciation ?? 0)
+                           + await DbHelper.ExecuteScalarAsync<long>(conn,
+                               @"SELECT COALESCE(SUM(amount), 0)
+                                 FROM coin_transactions
+                                 WHERE receiver_id = @uid AND status = 'completed'
+                                   AND transaction_type = 'super_chat'",
+                               new Dictionary<string, object?> { ["uid"] = userId });
+
+        // BUG#M6-2 FIX: Implement the 7-factor weighted fear score algorithm:
+        //   Views 30% + Unique Readers 15% + Comments 15% + Avg Read Time 10% +
+        //   Reactions 10% + Coins Received 10% + Completion Rate 10% = 100%
+        //
+        // Raw weights per unit (calibrated so thresholds Pret→Mahakaal span
+        // realistic creator sizes):
+        //   views × 0.30, uniqueReaders × 1.5, comments × 1.5,
+        //   reactions(likes) × 1.0, coinsReceived × 1.0
+        //
+        // TODO: avgReadTimeMinutes (10%) and completionRate (10%) require a
+        //   read_sessions / completion_events table that does not yet exist.
+        //   Their 20% weight is intentionally omitted until schema is extended.
+        //   The remaining 80% factors still produce a fair relative ranking.
+        long fearScore = (long)(
+            totalViews    * 0.30 +
+            uniqueReaders * 1.50 +
+            totalComments * 1.50 +
+            totalLikes    * 1.00 +
+            coinsReceived * 1.00
+        );
+
+        var (rankName, rankKey, rankIcon, rankLevel, rankMin, rankNext, nextRankName, rankProgress) = GetFearRank(fearScore);
         var (tier, tierIcon, tierShare, nextTierViews, tierProgress) = GetCreatorTier(thisMonthViews);
+
+        // BUG#M5-3 FIX: Include premium unlock earnings in totals.
+        long premiumTotal      = premiumUnlockEarnings?.Total     ?? 0;
+        long premiumThisMonth  = premiumUnlockEarnings?.ThisMonth ?? 0;
 
         long totalEarnings = (earnings?.Appreciation ?? 0)
                            + (earnings?.Leaderboard  ?? 0)
                            + (earnings?.Competition  ?? 0)
                            + (earnings?.Referral     ?? 0)
-                           + (earnings?.AdminCredits ?? 0);
+                           + (earnings?.AdminCredits ?? 0)
+                           + premiumTotal;
         // Note: signup_bonus is for the user personally, not creator revenue — excluded from total
 
         var response = new CreatorStatsResponse
         {
-            // Earnings
+            // Earnings — BUG#M5-3 FIX: premium unlock now included
             TotalEarningsCoins      = totalEarnings,
             TotalEarningsInr        = totalEarnings * CoinToInr,
-            ThisMonthEarningsCoins  = thisMonthEarnings,
-            ThisMonthEarningsInr    = thisMonthEarnings * CoinToInr,
+            ThisMonthEarningsCoins  = thisMonthEarnings + premiumThisMonth,
+            ThisMonthEarningsInr    = (thisMonthEarnings + premiumThisMonth) * CoinToInr,
+            PremiumUnlockEarnings   = premiumTotal,
             WalletBalance           = wallet?.Balance ?? 0,
             PendingWithdrawalCoins  = wallet?.PendingWithdrawal ?? 0,
             CanWithdraw             = (wallet?.Balance ?? 0) >= MinWithdrawal,
@@ -233,7 +314,10 @@ public class CreatorService : ICreatorService
             TierProgress          = Math.Min(100.0, tierProgress),
 
             // Fear Rank
-            FearRank             = rankName,
+            // BUG#M6-1 FIX: Return snake_case key ("pret_aatma") not display name ("Pret Aatma")
+            // Flutter's FearRanks.creatorRankMeta() looks up by key — display name lookup always
+            // fell back to creatorRanks.first (Pret Aatma), freezing all creators at rank 1.
+            FearRank             = rankKey,
             FearRankIcon         = rankIcon,
             FearRankLevel        = rankLevel,
             FearScore            = fearScore,
@@ -242,12 +326,13 @@ public class CreatorService : ICreatorService
             NextRankName         = nextRankName,
             MilestoneProgress    = Math.Min(100.0, rankProgress),
 
-            // Content
+            // Content — BUG#M5-4 FIX: total_comments now included
             StoriesCount         = storyStats?.TotalStories ?? 0,
             PublishedStoriesCount = storyStats?.Published    ?? 0,
             TotalEpisodesCount   = storyStats?.TotalEpisodes ?? 0,
             TotalViews           = totalViews,
             TotalLikes           = totalLikes,
+            TotalComments        = storyStats?.TotalComments ?? 0,
 
             // Social
             FollowersCount = (int)followers,
@@ -264,16 +349,18 @@ public class CreatorService : ICreatorService
 
     public async Task<EarningsHubResponse> GetEarningsHubAsync(Guid userId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M5-5 FIX: Use await using for proper async disposal of NpgsqlConnection.
+        await using var conn = await _db.CreateConnectionAsync();
 
         // Per-source breakdown using UNION
+        // BUG#M5-2 FIX: Use IST month boundary for "this month" aggregation.
         var rows = await DbHelper.ExecuteReaderAsync(conn,
             @"SELECT source,
                      SUM(coins)::bigint AS total_coins,
                      SUM(coins * 0.10)  AS total_inr,
-                     SUM(CASE WHEN date_trunc('month', ts) = date_trunc('month', NOW())
+                     SUM(CASE WHEN date_trunc('month', ts AT TIME ZONE 'Asia/Kolkata') = date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata')
                               THEN coins ELSE 0 END)::bigint AS this_month_coins,
-                     SUM(CASE WHEN date_trunc('month', ts) = date_trunc('month', NOW())
+                     SUM(CASE WHEN date_trunc('month', ts AT TIME ZONE 'Asia/Kolkata') = date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata')
                               THEN coins * 0.10 ELSE 0 END)  AS this_month_inr
               FROM (
                 SELECT 'appreciation' AS source,
@@ -328,7 +415,8 @@ public class CreatorService : ICreatorService
 
     public async Task<List<PremiumUnlockStoryDetail>> GetPremiumUnlockEarningsAsync(Guid userId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M5-5 FIX: Use await using for proper async disposal of NpgsqlConnection.
+        await using var conn = await _db.CreateConnectionAsync();
 
         var rows = await DbHelper.ExecuteReaderAsync(conn,
             @"SELECT s.id AS story_id, s.title AS story_title, s.thumbnail_url,
@@ -392,7 +480,8 @@ public class CreatorService : ICreatorService
     public async Task<(List<AppreciationDetailItem> Items, int Total)> GetAppreciationEarningsAsync(
         Guid userId, int page, int pageSize)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M5-5 FIX: Use await using for proper async disposal of NpgsqlConnection.
+        await using var conn = await _db.CreateConnectionAsync();
 
         var total = (int)await DbHelper.ExecuteScalarAsync<long>(conn,
             @"SELECT COUNT(DISTINCT sender_id) FROM coin_transactions
@@ -436,7 +525,8 @@ public class CreatorService : ICreatorService
     public async Task<(List<SuperChatDetailItem> Items, int Total)> GetSuperChatEarningsAsync(
         Guid userId, int page, int pageSize)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M5-5 FIX: Use await using for proper async disposal of NpgsqlConnection.
+        await using var conn = await _db.CreateConnectionAsync();
 
         // Super chats received — tracked in coin_transactions with receiver_id
         var total = (int)await DbHelper.ExecuteScalarAsync<long>(conn,
@@ -481,7 +571,8 @@ public class CreatorService : ICreatorService
 
     public async Task<List<CompetitionEarningDetail>> GetCompetitionEarningsAsync(Guid userId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M5-5 FIX: Use await using for proper async disposal of NpgsqlConnection.
+        await using var conn = await _db.CreateConnectionAsync();
 
         var rows = await DbHelper.ExecuteReaderAsync(conn,
             @"SELECT ct.id::text AS comp_id, ct.description AS comp_name,
@@ -512,7 +603,8 @@ public class CreatorService : ICreatorService
 
     public async Task<List<ReferralEarningDetail>> GetReferralEarningsAsync(Guid userId)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M5-5 FIX: Use await using for proper async disposal of NpgsqlConnection.
+        await using var conn = await _db.CreateConnectionAsync();
 
         var rows = await DbHelper.ExecuteReaderAsync(conn,
             @"SELECT u.id AS user_id, u.username, u.display_name, u.avatar_url,
@@ -546,7 +638,8 @@ public class CreatorService : ICreatorService
     public async Task<EarningsChartResponse> GetEarningsChartAsync(
         Guid userId, string period, DateTime from, DateTime to)
     {
-        using var conn = await _db.CreateConnectionAsync();
+        // BUG#M5-5 FIX: Use await using for proper async disposal of NpgsqlConnection.
+        await using var conn = await _db.CreateConnectionAsync();
 
         var (truncFn, labelFmt) = period.ToLower() switch
         {

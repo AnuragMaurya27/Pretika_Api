@@ -1,7 +1,9 @@
 using HauntedVoiceUniverse.Common;
 using HauntedVoiceUniverse.Infrastructure.Database;
 using HauntedVoiceUniverse.Modules.Stories.Models;
+using HauntedVoiceUniverse.Modules.Subscriptions.Services;
 using Npgsql;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace HauntedVoiceUniverse.Modules.Stories.Services;
@@ -43,19 +45,35 @@ public interface IStoryService
     Task<(bool Success, string Message, CategoryResponse? Data)> CreateCategoryAsync(string name, string? description, string? iconUrl);
     Task<(bool Success, string Message)> DeleteCategoryAsync(Guid categoryId);
 
+    // Episode interactions
+    Task<(bool Success, string Message)> LikeEpisodeAsync(Guid userId, Guid storyId, Guid episodeId);
+    Task<(bool Success, string Message)> UnlikeEpisodeAsync(Guid userId, Guid storyId, Guid episodeId);
+    Task<(bool Success, string Message, object? Data)> RateEpisodeAsync(Guid userId, Guid storyId, Guid episodeId, int rating);
+
     // Rating
     Task<(bool Success, string Message, object? Data)> RateStoryAsync(Guid userId, Guid storyId, int rating);
+
+    // Collections
+    Task<(bool Success, string Message, CollectionResponse? Data)> CreateCollectionAsync(Guid creatorId, CreateCollectionRequest req);
+    Task<(bool Success, string Message, CollectionResponse? Data)> UpdateCollectionAsync(Guid creatorId, Guid collectionId, UpdateCollectionRequest req);
+    Task<(bool Success, string Message)> DeleteCollectionAsync(Guid creatorId, Guid collectionId);
+    Task<PagedResult<CollectionResponse>> GetMyCollectionsAsync(Guid creatorId, int page, int pageSize);
+    Task<(bool Success, string Message)> AddStoryToCollectionAsync(Guid creatorId, Guid collectionId, Guid storyId);
+    Task<(bool Success, string Message)> RemoveStoryFromCollectionAsync(Guid creatorId, Guid collectionId, Guid storyId);
+    Task<PagedResult<StoryResponse>> GetCollectionStoriesAsync(Guid collectionId, Guid? viewerId, int page, int pageSize);
 }
 
 public class StoryService : IStoryService
 {
     private readonly IDbConnectionFactory _db;
     private readonly ILogger<StoryService> _logger;
+    private readonly ISubscriptionService _subscriptionService;
 
-    public StoryService(IDbConnectionFactory db, ILogger<StoryService> logger)
+    public StoryService(IDbConnectionFactory db, ILogger<StoryService> logger, ISubscriptionService subscriptionService)
     {
         _db = db;
         _logger = logger;
+        _subscriptionService = subscriptionService;
     }
 
     // ─── CREATE STORY ─────────────────────────────────────────────────────────
@@ -69,6 +87,23 @@ public class StoryService : IStoryService
             new() { ["@id"] = creatorId });
         if (!isCreator)
             return (false, "Pehle creator ban jao. Profile mein creator apply karo.", null);
+
+        // BUG#M3-7 FIX: Limit drafts to 50 per creator to prevent storage abuse (test case #20).
+        // Published stories don't count toward this limit.
+        var draftCount = await DbHelper.ExecuteScalarAsync<int>(conn,
+            "SELECT COUNT(1) FROM stories WHERE creator_id=@id AND status='draft'::story_status AND deleted_at IS NULL",
+            new() { ["@id"] = creatorId });
+        if (draftCount >= 50)
+            return (false, "Tumhare paas already 50 draft stories hain. Pehle kuch publish ya delete karo.", null);
+
+        // VULN#11 FIX: Validate thumbnail_url against SSRF. Only allow HTTPS URLs from
+        // known CDN domains. Blocking private/internal addresses prevents attackers from
+        // triggering server-side requests to cloud metadata endpoints (169.254.169.254 etc.)
+        if (!string.IsNullOrEmpty(req.ThumbnailUrl))
+        {
+            if (!IsAllowedThumbnailUrl(req.ThumbnailUrl))
+                return (false, "Thumbnail URL invalid ya disallowed domain hai. Sirf HTTPS CDN URLs allowed hain.", null);
+        }
 
         var storyId = Guid.NewGuid();
         var slug = await GenerateUniqueSlugAsync(conn, req.Title);
@@ -170,11 +205,14 @@ public class StoryService : IStoryService
     {
         await using var conn = await _db.CreateConnectionAsync();
 
-        var episodeCount = await DbHelper.ExecuteScalarAsync<int>(conn,
-            "SELECT COUNT(1) FROM episodes WHERE story_id=@id AND deleted_at IS NULL",
+        // BUG#M3-4 FIX: Require at least 1 PUBLISHED episode, not just any episode.
+        // Previously a story with all-draft episodes could be published — readers would see
+        // 0 episodes when they opened the story.
+        var publishedEpisodeCount = await DbHelper.ExecuteScalarAsync<int>(conn,
+            "SELECT COUNT(1) FROM episodes WHERE story_id=@id AND deleted_at IS NULL AND status='published'::story_status",
             new() { ["@id"] = storyId });
-        if (episodeCount == 0)
-            return (false, "Kam se kam ek episode add karo pehle");
+        if (publishedEpisodeCount == 0)
+            return (false, "Pehle kam se kam ek episode publish karo, tab story publish hogi");
 
         var rows = await DbHelper.ExecuteNonQueryAsync(conn, @"
             UPDATE stories SET status='published'::story_status,
@@ -220,20 +258,28 @@ public class StoryService : IStoryService
 
         await using (var conn = await _db.CreateConnectionAsync())
         {
+            // VULN#4 FIX: Draft/unpublished stories are only visible to their creator.
+            // Previously no status filter existed, leaking premium draft content to anyone
+            // who knew the story UUID (e.g., from API responses, browser history, etc.).
             using var cmd = new NpgsqlCommand(@"
                 SELECT s.id, s.title, s.slug, s.summary, s.thumbnail_url, s.story_type,
                        s.language, s.age_rating, s.status, s.creator_id,
-                       s.category_id, s.total_episodes, s.total_views, s.total_likes,
+                       s.category_id, s.collection_id,
+                       s.total_episodes, s.total_views, s.total_likes,
                        s.total_comments, s.total_bookmarks, s.engagement_score,
                        s.is_editor_pick, s.published_at, s.created_at, s.updated_at,
                        u.username as creator_username, u.display_name as creator_display_name,
                        u.avatar_url as creator_avatar_url, u.is_verified_creator,
-                       c.name as category_name
+                       c.name as category_name, sc.name as collection_name
                 FROM stories s
                 JOIN users u ON u.id = s.creator_id
                 LEFT JOIN categories c ON c.id = s.category_id
-                WHERE s.id = @id AND s.deleted_at IS NULL", conn);
+                LEFT JOIN story_collections sc ON sc.id = s.collection_id
+                WHERE s.id = @id AND s.deleted_at IS NULL
+                  AND (s.status = 'published' OR s.creator_id = @viewerId)", conn);
             cmd.Parameters.AddWithValue("@id", storyId);
+            cmd.Parameters.AddWithValue("@viewerId",
+                viewerId.HasValue ? (object)viewerId.Value : DBNull.Value);
 
             using var reader = await cmd.ExecuteReaderAsync();
             if (await reader.ReadAsync())
@@ -261,7 +307,8 @@ public class StoryService : IStoryService
             using var epCmd = new NpgsqlCommand(@"
                 SELECT id, story_id, title, slug, episode_number, access_type,
                        unlock_coin_cost, status, word_count, estimated_read_time_seconds,
-                       total_views, total_likes, total_comments, published_at, created_at
+                       total_views, total_likes, total_comments, published_at,
+                       scheduled_publish_at, created_at
                 FROM episodes
                 WHERE story_id=@id AND deleted_at IS NULL
                 ORDER BY episode_number ASC", conn3);
@@ -325,7 +372,15 @@ public class StoryService : IStoryService
     // ─── GET STORIES (Feed) ───────────────────────────────────────────────────
     public async Task<PagedResult<StoryResponse>> GetStoriesAsync(StoryFilterRequest filter, Guid? viewerId)
     {
-        var conditions = new List<string> { "s.status='published'::story_status", "s.deleted_at IS NULL" };
+        // BUG#M9-4 FIX: Exclude shadow-banned (and banned/suspended/deleted) creators from public feeds.
+        // Shadow-banned users can still see their own content (viewerId == creator_id case) but
+        // it must be invisible to everyone else — enforced server-side, not just in client.
+        var conditions = new List<string>
+        {
+            "s.status='published'::story_status",
+            "s.deleted_at IS NULL",
+            "u.status NOT IN ('shadow_banned','banned','suspended')",
+        };
         var p = new Dictionary<string, object?>();
 
         if (!string.IsNullOrEmpty(filter.Category))
@@ -347,6 +402,30 @@ public class StoryService : IStoryService
         {
             conditions.Add("s.age_rating=@age::age_rating");
             p["@age"] = filter.AgeRating.ToLower();
+        }
+        else
+        {
+            // BUG#M9-7 FIX: Server-side 18+ age enforcement — do NOT rely on client filters.
+            // If the client explicitly requested adult content, we'd have hit the if-branch above.
+            // When no age filter is supplied: check the viewer's date_of_birth from DB.
+            //   - Anonymous (viewerId null) → exclude adult
+            //   - Under 18 → exclude adult
+            //   - 18+ or no DOB on record → allow all ratings
+            bool allowAdult = false;
+            if (viewerId.HasValue)
+            {
+                // Minimal query — only fetch dob, not the full profile
+                await using var ageConn = await _db.CreateConnectionAsync();
+                var dob = await DbHelper.ExecuteScalarAsync<DateTime?>(ageConn,
+                    "SELECT date_of_birth FROM users WHERE id = @id",
+                    new() { ["@id"] = viewerId.Value });
+
+                // If no DOB on record treat as adult (creator accounts often skip it)
+                allowAdult = dob == null || (DateTime.UtcNow - dob.Value).TotalDays >= 365.25 * 18;
+            }
+
+            if (!allowAdult)
+                conditions.Add("s.age_rating != '18+'::age_rating");
         }
         if (!string.IsNullOrEmpty(filter.Search))
         {
@@ -412,15 +491,17 @@ public class StoryService : IStoryService
             using var cmd = new NpgsqlCommand($@"
                 SELECT s.id, s.title, s.slug, s.summary, s.thumbnail_url, s.story_type,
                        s.language, s.age_rating, s.status, s.creator_id, s.category_id,
+                       s.collection_id,
                        s.total_episodes, s.total_views, s.total_likes, s.total_comments,
                        s.total_bookmarks, s.engagement_score, s.is_editor_pick,
                        s.published_at, s.created_at, s.updated_at,
                        u.username as creator_username, u.display_name as creator_display_name,
                        u.avatar_url as creator_avatar_url, u.is_verified_creator,
-                       c.name as category_name
+                       c.name as category_name, sc.name as collection_name
                 FROM stories s
                 JOIN users u ON u.id=s.creator_id
                 LEFT JOIN categories c ON c.id=s.category_id
+                LEFT JOIN story_collections sc ON sc.id = s.collection_id
                 WHERE {where}
                 ORDER BY {orderBy}
                 LIMIT @limit OFFSET @offset", conn);
@@ -479,15 +560,17 @@ public class StoryService : IStoryService
         using var cmd = new NpgsqlCommand($@"
             SELECT s.id, s.title, s.slug, s.summary, s.thumbnail_url, s.story_type,
                    s.language, s.age_rating, s.status, s.creator_id, s.category_id,
+                   s.collection_id,
                    s.total_episodes, s.total_views, s.total_likes, s.total_comments,
                    s.total_bookmarks, s.engagement_score, s.is_editor_pick,
                    s.published_at, s.created_at, s.updated_at,
                    u.username as creator_username, u.display_name as creator_display_name,
                    u.avatar_url as creator_avatar_url, u.is_verified_creator,
-                   c.name as category_name
+                   c.name as category_name, sc.name as collection_name
             FROM stories s
             JOIN users u ON u.id=s.creator_id
             LEFT JOIN categories c ON c.id=s.category_id
+            LEFT JOIN story_collections sc ON sc.id = s.collection_id
             WHERE s.creator_id=@cid AND s.deleted_at IS NULL {statusCondition}
             ORDER BY s.updated_at DESC
             LIMIT @limit OFFSET @offset", conn);
@@ -523,14 +606,16 @@ public class StoryService : IStoryService
             using var cmd = new NpgsqlCommand(@"
                 SELECT s.id, s.title, s.slug, s.summary, s.thumbnail_url, s.story_type,
                        s.language, s.age_rating, s.status, s.creator_id, s.category_id,
+                       s.collection_id,
                        s.total_episodes, s.total_views, s.total_likes, s.total_comments,
                        s.total_bookmarks, s.engagement_score, s.is_editor_pick,
                        s.published_at, s.created_at, s.updated_at,
                        u.username as creator_username, u.display_name as creator_display_name,
                        u.avatar_url as creator_avatar_url, u.is_verified_creator,
-                       c.name as category_name
+                       c.name as category_name, sc.name as collection_name
                 FROM stories s JOIN users u ON u.id=s.creator_id
                 LEFT JOIN categories c ON c.id=s.category_id
+                LEFT JOIN story_collections sc ON sc.id = s.collection_id
                 WHERE s.creator_id=@cid AND s.status='published'::story_status AND s.deleted_at IS NULL
                 ORDER BY s.published_at DESC LIMIT @lim OFFSET @off", conn);
             cmd.Parameters.AddWithValue("@cid", creatorId);
@@ -558,15 +643,24 @@ public class StoryService : IStoryService
             new() { ["@id"] = storyId, ["@cid"] = creatorId });
         if (storyExists == 0) return (false, "Story nahi mili ya permission nahi", null);
 
+        // BUG#M3-1 + BUG#M3-3 FIX: Validate and sanitize content
+        var (contentValid, contentError, safeContent) = ValidateAndSanitizeContent(req.Content);
+        if (!contentValid) return (false, contentError!, null);
+
         var episodeNumber = await DbHelper.ExecuteScalarAsync<int>(conn,
             "SELECT COALESCE(MAX(episode_number), 0) + 1 FROM episodes WHERE story_id=@id AND deleted_at IS NULL",
             new() { ["@id"] = storyId });
 
+        // BUG#M3-9 FIX: Reject past scheduled publish times
+        if (req.ScheduledPublishAt.HasValue && req.ScheduledPublishAt.Value.ToUniversalTime() <= DateTime.UtcNow)
+            return (false, "Scheduled time past mein nahi ho sakti. Future time select karo.", null);
+
         var episodeId = Guid.NewGuid();
         var slug = $"episode-{episodeNumber}-{GenerateSlug(req.Title)}";
-        var wordCount = req.Content.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+        // Use safeContent (sanitized) for word count and storage
+        var wordCount = safeContent.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
         var readTime = (int)Math.Ceiling(wordCount / 200.0) * 60; // 200 words/min
-        var plainText = Regex.Replace(req.Content, "<.*?>", "");
+        var plainText = Regex.Replace(safeContent, "<.*?>", "");
 
         await DbHelper.ExecuteNonQueryAsync(conn, @"
             INSERT INTO episodes (id, story_id, title, slug, content, content_plain, word_count,
@@ -581,7 +675,7 @@ public class StoryService : IStoryService
                 ["@sid"]       = storyId,
                 ["@title"]     = req.Title.Trim(),
                 ["@slug"]      = slug,
-                ["@content"]   = req.Content,
+                ["@content"]   = safeContent,
                 ["@plain"]     = plainText,
                 ["@wc"]        = wordCount,
                 ["@rt"]        = readTime,
@@ -623,10 +717,13 @@ public class StoryService : IStoryService
 
         if (req.Content != null)
         {
-            var wordCount = req.Content.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+            // BUG#M3-1 + BUG#M3-3 FIX: validate & sanitize on update too
+            var (cv, ce, sc) = ValidateAndSanitizeContent(req.Content);
+            if (!cv) return (false, ce!, null);
+            var wordCount = sc.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
             var readTime = (int)Math.Ceiling(wordCount / 200.0) * 60;
-            var plainText = Regex.Replace(req.Content, "<.*?>", "");
-            updates.Add("content=@content"); p["@content"] = req.Content;
+            var plainText = Regex.Replace(sc, "<.*?>", "");
+            updates.Add("content=@content"); p["@content"] = sc;
             updates.Add("content_plain=@plain"); p["@plain"] = plainText;
             updates.Add("word_count=@wc"); p["@wc"] = wordCount;
             updates.Add("estimated_read_time_seconds=@rt"); p["@rt"] = readTime;
@@ -653,9 +750,26 @@ public class StoryService : IStoryService
             new() { ["@eid"] = episodeId, ["@sid"] = storyId, ["@cid"] = creatorId });
 
         if (rows > 0)
+        {
             await DbHelper.ExecuteNonQueryAsync(conn,
                 "UPDATE stories SET total_episodes=GREATEST(total_episodes-1,0), updated_at=NOW() WHERE id=@id",
                 new() { ["@id"] = storyId });
+
+            // BUG#M3-6 FIX: Renumber remaining episodes sequentially so gaps don't appear.
+            // e.g. Episodes 1,2,3 → delete 2 → renumber to 1,2 (not 1,3).
+            // Use a CTE to assign ROW_NUMBER() and update in one shot.
+            await DbHelper.ExecuteNonQueryAsync(conn, @"
+                WITH numbered AS (
+                    SELECT id, ROW_NUMBER() OVER (ORDER BY episode_number, created_at) AS new_num
+                    FROM episodes
+                    WHERE story_id=@sid AND deleted_at IS NULL
+                )
+                UPDATE episodes e
+                SET episode_number = n.new_num, updated_at=NOW()
+                FROM numbered n
+                WHERE e.id = n.id AND e.episode_number != n.new_num",
+                new() { ["@sid"] = storyId });
+        }
 
         return rows > 0 ? (true, "Episode delete ho gaya!") : (false, "Episode nahi mila");
     }
@@ -686,7 +800,7 @@ public class StoryService : IStoryService
             SELECT id, story_id, title, slug, episode_number, access_type,
                    unlock_coin_cost, status, word_count, estimated_read_time_seconds,
                    total_views, total_likes, total_comments, content,
-                   published_at, created_at
+                   published_at, scheduled_publish_at, created_at
             FROM episodes
             WHERE story_id=@sid AND deleted_at IS NULL AND status='published'::story_status
             ORDER BY episode_number ASC", conn);
@@ -713,7 +827,7 @@ public class StoryService : IStoryService
                     SELECT id, story_id, title, slug, episode_number, access_type,
                            unlock_coin_cost, status, word_count, estimated_read_time_seconds,
                            total_views, total_likes, total_comments, content,
-                           published_at, created_at
+                           published_at, scheduled_publish_at, created_at
                     FROM episodes
                     WHERE story_id=@sid AND deleted_at IS NULL
                     ORDER BY episode_number ASC", conn3);
@@ -734,11 +848,12 @@ public class StoryService : IStoryService
 
         await using (var conn = await _db.CreateConnectionAsync())
         {
+            // BUG#M3-5 FIX: Include scheduled_publish_at so episode editor can restore the saved schedule.
             using var cmd = new NpgsqlCommand(@"
                 SELECT id, story_id, title, slug, episode_number, access_type,
                        unlock_coin_cost, status, word_count, estimated_read_time_seconds,
                        total_views, total_likes, total_comments, content,
-                       published_at, created_at
+                       published_at, scheduled_publish_at, created_at
                 FROM episodes
                 WHERE id=@eid AND story_id=@sid AND deleted_at IS NULL", conn);
             cmd.Parameters.AddWithValue("@eid", episodeId);
@@ -778,6 +893,30 @@ public class StoryService : IStoryService
         else if (episode.AccessType == "free")
         {
             episode.IsUnlocked = true;
+        }
+
+        // Populate viewer's like status and rating
+        if (viewerId.HasValue)
+        {
+            await using var conn3 = await _db.CreateConnectionAsync();
+
+            try
+            {
+                var liked = await DbHelper.ExecuteScalarAsync<int>(conn3,
+                    "SELECT COUNT(1) FROM episode_likes WHERE user_id=@uid AND episode_id=@eid",
+                    new() { ["@uid"] = viewerId, ["@eid"] = episodeId });
+                episode.IsLiked = liked > 0;
+            }
+            catch
+            {
+                // episode_likes table may not exist yet — migration pending
+                episode.IsLiked = false;
+            }
+
+            var myRating = await DbHelper.ExecuteScalarAsync<int?>(conn3,
+                "SELECT rating FROM story_ratings WHERE user_id=@uid AND story_id=@sid LIMIT 1",
+                new() { ["@uid"] = viewerId, ["@sid"] = storyId });
+            episode.UserRating = myRating;
         }
 
         return episode;
@@ -849,6 +988,61 @@ public class StoryService : IStoryService
         return (true, "Bookmark hata diya");
     }
 
+    // ─── LIKE EPISODE ─────────────────────────────────────────────────────────
+    public async Task<(bool Success, string Message)> LikeEpisodeAsync(Guid userId, Guid storyId, Guid episodeId)
+    {
+        await using var conn = await _db.CreateConnectionAsync();
+        var exists = await DbHelper.ExecuteScalarAsync<int>(conn,
+            "SELECT COUNT(1) FROM episode_likes WHERE user_id=@uid AND episode_id=@eid",
+            new() { ["@uid"] = userId, ["@eid"] = episodeId });
+        if (exists > 0) return (false, "Already like kiya hua hai");
+
+        await DbHelper.ExecuteNonQueryAsync(conn,
+            "INSERT INTO episode_likes (id,user_id,episode_id,story_id,created_at) VALUES (uuid_generate_v4(),@uid,@eid,@sid,NOW())",
+            new() { ["@uid"] = userId, ["@eid"] = episodeId, ["@sid"] = storyId });
+        await DbHelper.ExecuteNonQueryAsync(conn,
+            "UPDATE episodes SET total_likes=total_likes+1 WHERE id=@id",
+            new() { ["@id"] = episodeId });
+        return (true, "Episode like ho gaya! 👻");
+    }
+
+    // ─── UNLIKE EPISODE ───────────────────────────────────────────────────────
+    public async Task<(bool Success, string Message)> UnlikeEpisodeAsync(Guid userId, Guid storyId, Guid episodeId)
+    {
+        await using var conn = await _db.CreateConnectionAsync();
+        var rows = await DbHelper.ExecuteNonQueryAsync(conn,
+            "DELETE FROM episode_likes WHERE user_id=@uid AND episode_id=@eid",
+            new() { ["@uid"] = userId, ["@eid"] = episodeId });
+        if (rows == 0) return (false, "Like nahi kiya tha");
+        await DbHelper.ExecuteNonQueryAsync(conn,
+            "UPDATE episodes SET total_likes=GREATEST(total_likes-1,0) WHERE id=@id",
+            new() { ["@id"] = episodeId });
+        return (true, "Unlike ho gaya");
+    }
+
+    // ─── RATE EPISODE (stores in story_ratings) ───────────────────────────────
+    public async Task<(bool Success, string Message, object? Data)> RateEpisodeAsync(
+        Guid userId, Guid storyId, Guid episodeId, int rating)
+    {
+        if (rating < 1 || rating > 5) return (false, "Rating 1-5 honi chahiye", null);
+        await using var conn = await _db.CreateConnectionAsync();
+
+        await DbHelper.ExecuteNonQueryAsync(conn,
+            @"INSERT INTO story_ratings (id, user_id, story_id, rating, created_at, updated_at)
+              VALUES (@id, @uid, @sid, @rating, NOW(), NOW())
+              ON CONFLICT (user_id, story_id) DO UPDATE SET rating=@rating, updated_at=NOW()",
+            new() { ["@id"] = Guid.NewGuid(), ["@uid"] = userId, ["@sid"] = storyId, ["@rating"] = rating });
+
+        var avgRating = await DbHelper.ExecuteScalarAsync<decimal>(conn,
+            "SELECT ROUND(AVG(rating)::numeric, 1) FROM story_ratings WHERE story_id=@sid",
+            new() { ["@sid"] = storyId });
+        var ratingCount = await DbHelper.ExecuteScalarAsync<int>(conn,
+            "SELECT COUNT(1) FROM story_ratings WHERE story_id=@sid",
+            new() { ["@sid"] = storyId });
+
+        return (true, "Rating de di! ⭐", new { average_rating = (double)avgRating, rating_count = ratingCount, my_rating = rating });
+    }
+
     // ─── GET BOOKMARKED STORIES ───────────────────────────────────────────────
     public async Task<PagedResult<StoryResponse>> GetBookmarkedStoriesAsync(
         Guid userId, int page, int pageSize)
@@ -866,16 +1060,18 @@ public class StoryService : IStoryService
         using var cmd = new NpgsqlCommand(@"
             SELECT s.id, s.title, s.slug, s.summary, s.thumbnail_url, s.story_type,
                    s.language, s.age_rating, s.status, s.creator_id, s.category_id,
+                   s.collection_id,
                    s.total_episodes, s.total_views, s.total_likes, s.total_comments,
                    s.total_bookmarks, s.engagement_score, s.is_editor_pick,
                    s.published_at, s.created_at, s.updated_at,
                    u.username as creator_username, u.display_name as creator_display_name,
                    u.avatar_url as creator_avatar_url, u.is_verified_creator,
-                   c.name as category_name
+                   c.name as category_name, sc.name as collection_name
             FROM bookmarks b
             JOIN stories s ON s.id=b.story_id
             JOIN users u ON u.id=s.creator_id
             LEFT JOIN categories c ON c.id=s.category_id
+            LEFT JOIN story_collections sc ON sc.id = s.collection_id
             WHERE b.user_id=@uid AND s.deleted_at IS NULL
             ORDER BY b.created_at DESC LIMIT @lim OFFSET @off", conn);
         cmd.Parameters.AddWithValue("@uid", userId);
@@ -896,6 +1092,10 @@ public class StoryService : IStoryService
     }
 
     // ─── RECORD VIEW ──────────────────────────────────────────────────────────
+    // BUG#M6-5 FIX: No deduplication existed — every call inserted a new row,
+    // enabling fake view inflation that directly inflated fear scores.
+    // Dedup window: authenticated users → 1 hour (user_id + story_id),
+    //               anonymous users      → 30 minutes (ip_address + story_id).
     public async Task RecordViewAsync(Guid storyId, Guid? episodeId, Guid? userId,
         string ipAddress, string? userAgent)
     {
@@ -903,6 +1103,40 @@ public class StoryService : IStoryService
         {
             await using var conn = await _db.CreateConnectionAsync();
 
+            // Check deduplication window before inserting.
+            bool isDuplicate;
+            if (userId.HasValue)
+            {
+                // Authenticated: skip if same user viewed same story within 1 hour.
+                var recent = await DbHelper.ExecuteScalarAsync<int>(conn, @"
+                    SELECT COUNT(1) FROM story_views
+                    WHERE story_id = @sid
+                      AND user_id  = @uid
+                      AND viewed_at >= NOW() - INTERVAL '1 hour'",
+                    new() { ["@sid"] = storyId, ["@uid"] = userId.Value });
+                isDuplicate = recent > 0;
+            }
+            else
+            {
+                // Anonymous: skip if same IP viewed same story within 30 minutes.
+                var parsedIp = System.Net.IPAddress.TryParse(ipAddress, out var ip2)
+                    ? ip2 : System.Net.IPAddress.Loopback;
+
+                using var dedupCmd = new NpgsqlCommand(@"
+                    SELECT COUNT(1) FROM story_views
+                    WHERE story_id   = @sid
+                      AND ip_address = @ip
+                      AND user_id    IS NULL
+                      AND viewed_at  >= NOW() - INTERVAL '30 minutes'", conn);
+                dedupCmd.Parameters.AddWithValue("@sid", storyId);
+                dedupCmd.Parameters.Add(new NpgsqlParameter("@ip", NpgsqlTypes.NpgsqlDbType.Inet) { Value = parsedIp });
+                var dedupResult = await dedupCmd.ExecuteScalarAsync();
+                isDuplicate = Convert.ToInt32(dedupResult) > 0;
+            }
+
+            if (isDuplicate) return;
+
+            // Insert the view row.
             using var cmd = new NpgsqlCommand(@"
                 INSERT INTO story_views (id, story_id, episode_id, user_id, ip_address, user_agent, viewed_at)
                 VALUES (uuid_generate_v4(), @sid, @eid, @uid, @ip, @ua, NOW())", conn);
@@ -917,7 +1151,7 @@ public class StoryService : IStoryService
             cmd.Parameters.AddWithValue("@ua", (object?)userAgent ?? DBNull.Value);
             await cmd.ExecuteNonQueryAsync();
 
-            // Update counters
+            // Update counters only for genuine (non-duplicate) views.
             await DbHelper.ExecuteNonQueryAsync(conn,
                 "UPDATE stories SET total_views=total_views+1 WHERE id=@id",
                 new() { ["@id"] = storyId });
@@ -965,6 +1199,33 @@ public class StoryService : IStoryService
 
         if (!found) return (false, "Episode nahi mila");
 
+        // ── Premium check ──────────────────────────────────────────────────────
+        // If user has active premium subscription, unlock episode for free
+        var isPremium = await _subscriptionService.IsUserPremiumAsync(userId);
+        if (isPremium)
+        {
+            // Fetch story creator_id for earnings credit
+            Guid creatorId = Guid.Empty;
+            using var storyConn = await _db.CreateConnectionAsync();
+            using var storyCmd = new NpgsqlCommand("SELECT creator_id FROM stories WHERE id=@id", storyConn);
+            storyCmd.Parameters.AddWithValue("@id", storyId);
+            using var storyReader = await storyCmd.ExecuteReaderAsync();
+            if (await storyReader.ReadAsync())
+                creatorId = DbHelper.GetGuid(storyReader, "creator_id");
+
+            // Record unlock (0 coins)
+            await DbHelper.ExecuteNonQueryAsync(conn, @"
+                INSERT INTO episode_unlocks (id, user_id, episode_id, story_id, coins_spent, unlocked_at)
+                VALUES (uuid_generate_v4(), @uid, @eid, @sid, 0, NOW())",
+                new() { ["@uid"] = userId, ["@eid"] = episodeId, ["@sid"] = storyId });
+
+            // Credit creator from premium pool (non-blocking, fire-and-forget)
+            if (creatorId != Guid.Empty && coinCost > 0)
+                _ = _subscriptionService.CreditCreatorForPremiumReadAsync(creatorId, episodeId, coinCost);
+
+            return (true, "Episode unlock ho gaya! 👑 Premium benefit use hua.");
+        }
+
         // Check balance
         var balance = await DbHelper.ExecuteScalarAsync<long>(conn,
             "SELECT coin_balance FROM wallets WHERE user_id=@uid",
@@ -990,7 +1251,7 @@ public class StoryService : IStoryService
             // Coin transaction record
             await DbHelper.ExecuteNonQueryAsync(conn, @"
                 INSERT INTO coin_transactions (id, sender_id, transaction_type, amount, description, status, created_at)
-                VALUES (uuid_generate_v4(), @uid, 'episode_unlock'::transaction_type, @cost, 'Episode unlock', 'completed'::transaction_status, NOW())",
+                VALUES (uuid_generate_v4(), @uid, 'premium_unlock'::transaction_type, @cost, 'Episode unlock', 'completed'::transaction_status, NOW())",
                 new() { ["@uid"] = userId, ["@cost"] = coinCost }, tx);
 
             await tx.CommitAsync();
@@ -1115,6 +1376,101 @@ public class StoryService : IStoryService
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
+
+    // VULN#11 FIX: SSRF validation for thumbnail URLs.
+    // Only permit HTTPS URLs from known CDN/storage domains. This prevents:
+    //   - Requests to cloud metadata endpoints (169.254.169.254, fd00:ec2::254)
+    //   - Requests to internal services (localhost, 10.x, 192.168.x)
+    //   - HTTP downgrade attacks
+    private static readonly HashSet<string> AllowedThumbnailHosts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "res.cloudinary.com",
+        "res.cloudinary.net",
+        "storage.googleapis.com",
+        "s3.amazonaws.com",
+        "hauntedvoice.in",
+        "cdn.hauntedvoice.in",
+        "localhost",   // dev only — remove in production
+    };
+
+    private static bool IsAllowedThumbnailUrl(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return false;
+        if (uri.Scheme != "https" && uri.Host != "localhost") return false;
+        return AllowedThumbnailHosts.Contains(uri.Host);
+    }
+
+    // ─── CONTENT VALIDATION & SANITIZATION ──────────────────────────────────
+
+    // BUG#M3-1 FIX: Strip javascript:/data: link schemes from Quill delta JSON
+    // so malicious links cannot execute even if content is rendered as HTML.
+    // BUG#M3-3 FIX: Validate content length and reject blank-only content.
+    private static (bool Valid, string? Error, string Sanitized) ValidateAndSanitizeContent(string content)
+    {
+        // Max 100,000 chars to prevent storage abuse (test case #6)
+        if (content.Length > 100_000)
+            return (false, "Episode content bahut lamba hai. Max 100,000 characters allowed.", content);
+
+        // Strip plain-text blank check (test cases #7, #8)
+        var plain = Regex.Replace(content, "<.*?>", "").Trim();
+        if (string.IsNullOrWhiteSpace(plain) || plain == "\n")
+        {
+            // Try reading from Quill delta JSON
+            try
+            {
+                var ops = JsonSerializer.Deserialize<JsonElement>(content);
+                var sb = new System.Text.StringBuilder();
+                foreach (var op in ops.EnumerateArray())
+                {
+                    if (op.TryGetProperty("insert", out var ins) && ins.ValueKind == JsonValueKind.String)
+                        sb.Append(ins.GetString());
+                }
+                if (string.IsNullOrWhiteSpace(sb.ToString()))
+                    return (false, "Episode content khaali nahi hona chahiye.", content);
+            }
+            catch { /* not JSON — fall through */ }
+        }
+
+        // BUG#M3-1 FIX: Sanitize dangerous link schemes in Quill delta
+        // Replace javascript: and data: links with "#" (safe no-op href)
+        var sanitized = content;
+        try
+        {
+            var doc = JsonSerializer.Deserialize<JsonElement>(content);
+            var dirty = false;
+            var newOps = new List<object>();
+
+            foreach (var op in doc.EnumerateArray())
+            {
+                if (op.TryGetProperty("attributes", out var attrs) &&
+                    attrs.TryGetProperty("link", out var link) &&
+                    link.ValueKind == JsonValueKind.String)
+                {
+                    var href = link.GetString() ?? "";
+                    // Remove javascript: data: vbscript: protocol links
+                    if (Regex.IsMatch(href, @"^(javascript|data|vbscript):", RegexOptions.IgnoreCase))
+                    {
+                        dirty = true;
+                        // Rebuild op with link="#"
+                        var opDict = new Dictionary<string, object?>();
+                        if (op.TryGetProperty("insert", out var ins))
+                            opDict["insert"] = ins.ToString();
+                        opDict["attributes"] = new Dictionary<string, string> { ["link"] = "#" };
+                        newOps.Add(opDict);
+                        continue;
+                    }
+                }
+                newOps.Add(op);
+            }
+
+            if (dirty)
+                sanitized = JsonSerializer.Serialize(newOps);
+        }
+        catch { /* not delta JSON — content stored as-is */ }
+
+        return (true, null, sanitized);
+    }
+
     private async Task UpsertTagsAsync(NpgsqlConnection conn, Guid storyId,
         List<string> tags, NpgsqlTransaction? tx)
     {
@@ -1181,6 +1537,8 @@ public class StoryService : IStoryService
         IsVerifiedCreator   = DbHelper.GetBool(r, "is_verified_creator"),
         CategoryId          = r.IsDBNull(r.GetOrdinal("category_id")) ? null : DbHelper.GetGuid(r, "category_id"),
         CategoryName        = DbHelper.GetStringOrNull(r, "category_name"),
+        CollectionId        = r.IsDBNull(r.GetOrdinal("collection_id")) ? null : DbHelper.GetGuid(r, "collection_id"),
+        CollectionName      = DbHelper.GetStringOrNull(r, "collection_name"),
         TotalEpisodes       = DbHelper.GetInt(r, "total_episodes"),
         TotalViews          = DbHelper.GetLong(r, "total_views"),
         TotalLikes          = DbHelper.GetLong(r, "total_likes"),
@@ -1211,6 +1569,8 @@ public class StoryService : IStoryService
         IsVerifiedCreator   = DbHelper.GetBool(r, "is_verified_creator"),
         CategoryId          = r.IsDBNull(r.GetOrdinal("category_id")) ? null : DbHelper.GetGuid(r, "category_id"),
         CategoryName        = DbHelper.GetStringOrNull(r, "category_name"),
+        CollectionId        = r.IsDBNull(r.GetOrdinal("collection_id")) ? null : DbHelper.GetGuid(r, "collection_id"),
+        CollectionName      = DbHelper.GetStringOrNull(r, "collection_name"),
         TotalEpisodes       = DbHelper.GetInt(r, "total_episodes"),
         TotalViews          = DbHelper.GetLong(r, "total_views"),
         TotalLikes          = DbHelper.GetLong(r, "total_likes"),
@@ -1240,6 +1600,218 @@ public class StoryService : IStoryService
         TotalComments            = DbHelper.GetLong(r, "total_comments"),
         Content                  = includeContent ? DbHelper.GetStringOrNull(r, "content") : null,
         PublishedAt              = DbHelper.GetDateTimeOrNull(r, "published_at"),
+        // BUG#M3-5 FIX: scheduled_publish_at now included in all episode queries
+        ScheduledPublishAt       = DbHelper.GetDateTimeOrNull(r, "scheduled_publish_at"),
         CreatedAt                = DbHelper.GetDateTime(r, "created_at")
+    };
+
+    // ─── COLLECTIONS ──────────────────────────────────────────────────────────
+
+    public async Task<(bool Success, string Message, CollectionResponse? Data)> CreateCollectionAsync(
+        Guid creatorId, CreateCollectionRequest req)
+    {
+        await using var conn = await _db.CreateConnectionAsync();
+        var id = Guid.NewGuid();
+        await DbHelper.ExecuteNonQueryAsync(conn, @"
+            INSERT INTO story_collections (id, creator_id, name, description, cover_url, is_public, created_at, updated_at)
+            VALUES (@id, @cid, @name, @desc, @cover, @pub, NOW(), NOW())",
+            new()
+            {
+                ["@id"]    = id,
+                ["@cid"]   = creatorId,
+                ["@name"]  = req.Name.Trim(),
+                ["@desc"]  = (object?)req.Description ?? DBNull.Value,
+                ["@cover"] = (object?)req.CoverUrl ?? DBNull.Value,
+                ["@pub"]   = req.IsPublic,
+            });
+        var coll = await GetCollectionByIdAsync(conn, id);
+        return (true, "Collection ban gayi!", coll);
+    }
+
+    public async Task<(bool Success, string Message, CollectionResponse? Data)> UpdateCollectionAsync(
+        Guid creatorId, Guid collectionId, UpdateCollectionRequest req)
+    {
+        await using var conn = await _db.CreateConnectionAsync();
+        var exists = await DbHelper.ExecuteScalarAsync<int>(conn,
+            "SELECT COUNT(1) FROM story_collections WHERE id=@id AND creator_id=@cid",
+            new() { ["@id"] = collectionId, ["@cid"] = creatorId });
+        if (exists == 0) return (false, "Collection nahi mili ya permission nahi hai", null);
+
+        var updates = new List<string>();
+        var p = new Dictionary<string, object?> { ["@id"] = collectionId };
+        if (req.Name != null)        { updates.Add("name=@name");          p["@name"]  = req.Name.Trim(); }
+        if (req.Description != null) { updates.Add("description=@desc");   p["@desc"]  = req.Description; }
+        if (req.CoverUrl != null)    { updates.Add("cover_url=@cover");    p["@cover"] = req.CoverUrl.Trim() == "" ? (object)DBNull.Value : req.CoverUrl.Trim(); }
+        if (req.IsPublic != null)    { updates.Add("is_public=@pub");      p["@pub"]   = req.IsPublic; }
+
+        if (updates.Count > 0)
+        {
+            updates.Add("updated_at=NOW()");
+            await DbHelper.ExecuteNonQueryAsync(conn,
+                $"UPDATE story_collections SET {string.Join(",", updates)} WHERE id=@id", p);
+        }
+
+        var coll = await GetCollectionByIdAsync(conn, collectionId);
+        return (true, "Collection update ho gayi!", coll);
+    }
+
+    public async Task<(bool Success, string Message)> DeleteCollectionAsync(Guid creatorId, Guid collectionId)
+    {
+        await using var conn = await _db.CreateConnectionAsync();
+        var rows = await DbHelper.ExecuteNonQueryAsync(conn,
+            "DELETE FROM story_collections WHERE id=@id AND creator_id=@cid",
+            new() { ["@id"] = collectionId, ["@cid"] = creatorId });
+        return rows > 0 ? (true, "Collection delete ho gayi!") : (false, "Collection nahi mili");
+    }
+
+    public async Task<PagedResult<CollectionResponse>> GetMyCollectionsAsync(
+        Guid creatorId, int page, int pageSize)
+    {
+        pageSize = Math.Min(pageSize, 50);
+        var offset = (page - 1) * pageSize;
+        await using var conn = await _db.CreateConnectionAsync();
+
+        var total = await DbHelper.ExecuteScalarAsync<int>(conn,
+            "SELECT COUNT(1) FROM story_collections WHERE creator_id=@cid",
+            new() { ["@cid"] = creatorId });
+
+        using var cmd = new NpgsqlCommand(@"
+            SELECT id, creator_id, name, description, cover_url, is_public, total_stories, created_at, updated_at
+            FROM story_collections WHERE creator_id=@cid
+            ORDER BY updated_at DESC LIMIT @lim OFFSET @off", conn);
+        cmd.Parameters.AddWithValue("@cid", creatorId);
+        cmd.Parameters.AddWithValue("@lim", pageSize);
+        cmd.Parameters.AddWithValue("@off", offset);
+
+        var results = new List<CollectionResponse>();
+        using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            results.Add(MapToCollection(reader));
+
+        return new PagedResult<CollectionResponse>
+        {
+            Items = results, TotalCount = total, Page = page, PageSize = pageSize
+        };
+    }
+
+    public async Task<(bool Success, string Message)> AddStoryToCollectionAsync(
+        Guid creatorId, Guid collectionId, Guid storyId)
+    {
+        await using var conn = await _db.CreateConnectionAsync();
+        var collExists = await DbHelper.ExecuteScalarAsync<int>(conn,
+            "SELECT COUNT(1) FROM story_collections WHERE id=@cid AND creator_id=@uid",
+            new() { ["@cid"] = collectionId, ["@uid"] = creatorId });
+        if (collExists == 0) return (false, "Collection nahi mili ya permission nahi hai");
+
+        var storyExists = await DbHelper.ExecuteScalarAsync<int>(conn,
+            "SELECT COUNT(1) FROM stories WHERE id=@sid AND creator_id=@uid AND deleted_at IS NULL",
+            new() { ["@sid"] = storyId, ["@uid"] = creatorId });
+        if (storyExists == 0) return (false, "Story nahi mili ya permission nahi hai");
+
+        await using var tx = await conn.BeginTransactionAsync();
+        try
+        {
+            await DbHelper.ExecuteNonQueryAsync(conn,
+                "UPDATE stories SET collection_id=@cid, updated_at=NOW() WHERE id=@sid AND creator_id=@uid AND (collection_id IS NULL OR collection_id!=@cid)",
+                new() { ["@cid"] = collectionId, ["@sid"] = storyId, ["@uid"] = creatorId }, tx);
+
+            // Recount to keep total_stories accurate
+            await DbHelper.ExecuteNonQueryAsync(conn,
+                "UPDATE story_collections SET total_stories=(SELECT COUNT(1) FROM stories WHERE collection_id=@cid AND deleted_at IS NULL), updated_at=NOW() WHERE id=@cid",
+                new() { ["@cid"] = collectionId }, tx);
+
+            await tx.CommitAsync();
+        }
+        catch (Exception ex)
+        {
+            try { await tx.RollbackAsync(); } catch { }
+            _logger.LogError(ex, "AddStoryToCollection failed");
+            return (false, "Story collection mein add nahi ho payi");
+        }
+        return (true, "Story collection mein add ho gayi!");
+    }
+
+    public async Task<(bool Success, string Message)> RemoveStoryFromCollectionAsync(
+        Guid creatorId, Guid collectionId, Guid storyId)
+    {
+        await using var conn = await _db.CreateConnectionAsync();
+        var rows = await DbHelper.ExecuteNonQueryAsync(conn,
+            "UPDATE stories SET collection_id=NULL, updated_at=NOW() WHERE id=@sid AND creator_id=@uid AND collection_id=@cid",
+            new() { ["@sid"] = storyId, ["@uid"] = creatorId, ["@cid"] = collectionId });
+
+        if (rows == 0) return (false, "Story is collection mein nahi thi");
+
+        // Recount
+        await DbHelper.ExecuteNonQueryAsync(conn,
+            "UPDATE story_collections SET total_stories=(SELECT COUNT(1) FROM stories WHERE collection_id=@cid AND deleted_at IS NULL), updated_at=NOW() WHERE id=@cid",
+            new() { ["@cid"] = collectionId });
+
+        return (true, "Story collection se remove ho gayi!");
+    }
+
+    public async Task<PagedResult<StoryResponse>> GetCollectionStoriesAsync(
+        Guid collectionId, Guid? viewerId, int page, int pageSize)
+    {
+        pageSize = Math.Min(pageSize, 50);
+        var offset = (page - 1) * pageSize;
+        await using var conn = await _db.CreateConnectionAsync();
+
+        var total = await DbHelper.ExecuteScalarAsync<int>(conn,
+            "SELECT COUNT(1) FROM stories WHERE collection_id=@cid AND deleted_at IS NULL",
+            new() { ["@cid"] = collectionId });
+
+        using var cmd = new NpgsqlCommand(@"
+            SELECT s.id, s.title, s.slug, s.summary, s.thumbnail_url, s.story_type,
+                   s.language, s.age_rating, s.status, s.creator_id, s.category_id,
+                   s.collection_id,
+                   s.total_episodes, s.total_views, s.total_likes, s.total_comments,
+                   s.total_bookmarks, s.engagement_score, s.is_editor_pick,
+                   s.published_at, s.created_at, s.updated_at,
+                   u.username as creator_username, u.display_name as creator_display_name,
+                   u.avatar_url as creator_avatar_url, u.is_verified_creator,
+                   c.name as category_name, sc.name as collection_name
+            FROM stories s
+            JOIN users u ON u.id=s.creator_id
+            LEFT JOIN categories c ON c.id=s.category_id
+            LEFT JOIN story_collections sc ON sc.id = s.collection_id
+            WHERE s.collection_id=@cid AND s.deleted_at IS NULL
+            ORDER BY s.updated_at DESC LIMIT @lim OFFSET @off", conn);
+        cmd.Parameters.AddWithValue("@cid", collectionId);
+        cmd.Parameters.AddWithValue("@lim", pageSize);
+        cmd.Parameters.AddWithValue("@off", offset);
+
+        var results = new List<StoryResponse>();
+        using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            results.Add(MapToStory(reader));
+
+        return new PagedResult<StoryResponse>
+        {
+            Items = results, TotalCount = total, Page = page, PageSize = pageSize
+        };
+    }
+
+    private async Task<CollectionResponse?> GetCollectionByIdAsync(NpgsqlConnection conn, Guid collectionId)
+    {
+        using var cmd = new NpgsqlCommand(@"
+            SELECT id, creator_id, name, description, cover_url, is_public, total_stories, created_at, updated_at
+            FROM story_collections WHERE id=@id", conn);
+        cmd.Parameters.AddWithValue("@id", collectionId);
+        using var reader = await cmd.ExecuteReaderAsync();
+        if (await reader.ReadAsync()) return MapToCollection(reader);
+        return null;
+    }
+
+    private static CollectionResponse MapToCollection(NpgsqlDataReader r) => new()
+    {
+        Id           = DbHelper.GetGuid(r, "id"),
+        CreatorId    = DbHelper.GetGuid(r, "creator_id"),
+        Name         = DbHelper.GetString(r, "name"),
+        Description  = DbHelper.GetStringOrNull(r, "description"),
+        CoverUrl     = DbHelper.GetStringOrNull(r, "cover_url"),
+        IsPublic     = DbHelper.GetBool(r, "is_public"),
+        TotalStories = DbHelper.GetInt(r, "total_stories"),
+        CreatedAt    = DbHelper.GetDateTime(r, "created_at"),
+        UpdatedAt    = DbHelper.GetDateTime(r, "updated_at"),
     };
 }

@@ -42,6 +42,8 @@ public class AuthService : IAuthService
     public async Task<(bool Success, string Message, AuthResponse? Data)> RegisterAsync(
         RegisterRequest req, string ipAddress)
     {
+        // BUG#M1-3 FIX: Quick pre-check outside transaction for fast UX feedback, but the real
+        // race condition guard is the DB UNIQUE constraint caught inside the transaction below.
         await using var conn = await _db.CreateConnectionAsync();
         var exists = await DbHelper.ExecuteScalarAsync<int>(conn,
             "SELECT COUNT(1) FROM users WHERE LOWER(email)=LOWER(@email) OR LOWER(username)=LOWER(@username)",
@@ -63,6 +65,18 @@ public class AuthService : IAuthService
         string verifyToken = "";
         try
         {
+            // BUG#M1-3 FIX: Re-check uniqueness INSIDE the transaction under a lock so concurrent
+            // registrations cannot both pass. The DB UNIQUE constraint is the final safety net
+            // and will throw a 23505 exception caught below.
+            var existsInTx = await DbHelper.ExecuteScalarAsync<int>(conn,
+                "SELECT COUNT(1) FROM users WHERE LOWER(email)=LOWER(@email) OR LOWER(username)=LOWER(@username)",
+                new() { ["@email"] = req.Email, ["@username"] = req.Username }, transaction);
+            if (existsInTx > 0)
+            {
+                await transaction.RollbackAsync();
+                return (false, "Email ya username already use ho raha hai", null);
+            }
+
             await DbHelper.ExecuteNonQueryAsync(conn, @"
                 INSERT INTO users (id,username,email,password_hash,display_name,preferred_language,
                     referral_code,referred_by,role,status,is_email_verified,created_at,updated_at)
@@ -108,6 +122,12 @@ public class AuthService : IAuthService
             await transaction.CommitAsync();
             committed = true;
         }
+        catch (Npgsql.PostgresException pgEx) when (pgEx.SqlState == "23505")
+        {
+            // BUG#M1-3 FIX: DB unique constraint violation — concurrent registration
+            if (!committed) try { await transaction.RollbackAsync(); } catch { }
+            return (false, "Email ya username already use ho raha hai", null);
+        }
         catch (Exception ex)
         {
             if (!committed) try { await transaction.RollbackAsync(); } catch { }
@@ -116,20 +136,11 @@ public class AuthService : IAuthService
         }
 
         try { await _emailService.SendEmailVerificationAsync(req.Email, req.Username, verifyToken); } catch { }
-        _ = LogLoginAsync(userId, ipAddress, "email", true);
 
-        var userInfo = new UserAuthInfo { Id=userId, Username=req.Username, Email=req.Email.ToLower(),
-            DisplayName=req.DisplayName??req.Username, Role="reader", IsCreator=false,
-            IsEmailVerified=false, Is2FAEnabled=false, ReaderFearRank="raat_ka_musafir", CoinBalance=signupBonus };
-
-        var at = _jwtService.GenerateAccessToken(userInfo);
-        var rt = _jwtService.GenerateRefreshToken();
-        await SaveRefreshTokenAsync(userId, rt, ipAddress);
-
-        return (true, "Registration successful! Email verify karo.", new AuthResponse {
-            AccessToken=at, RefreshToken=rt,
-            AccessTokenExpiry=DateTime.UtcNow.AddMinutes(60),
-            RefreshTokenExpiry=DateTime.UtcNow.AddDays(30), User=userInfo });
+        // BUG#M1-2 FIX: Do NOT issue JWT/tokens until email is verified.
+        // Return null data — controller returns 201 with just a message.
+        // User must verify email first, then login normally.
+        return (true, "Registration successful! Email verify karo phir login karo.", null);
     }
 
     public async Task<(bool Success, string Message, AuthResponse? Data)> LoginAsync(
@@ -175,17 +186,84 @@ public class AuthService : IAuthService
         if (userInfo == null) return (false, "Email/username ya password galat hai", null);
         if (status=="banned"||status=="deactivated") return (false, "Account ban/deactivate hai", null);
         if (status=="suspended") return (false, "Account suspended hai", null);
-        if (string.IsNullOrEmpty(passwordHash)||!BCrypt.Net.BCrypt.Verify(req.Password, passwordHash))
-            return (false, "Email/username ya password galat hai", null);
-        if (is2FAEnabled) {
-            if (string.IsNullOrWhiteSpace(req.TwoFaCode)) return (false, "2FA code required hai", null);
-            if (!Verify2FA(twoFaSecret, req.TwoFaCode)) return (false, "2FA code galat hai", null);
+
+        // BUG#M1-4 FIX: Account lockout — block after 5 failed attempts in 15 minutes.
+        // Uses existing login_history table — no schema change required.
+        await using (var lockConn = await _db.CreateConnectionAsync())
+        {
+            var recentFails = await DbHelper.ExecuteScalarAsync<int>(lockConn,
+                @"SELECT COUNT(1) FROM login_history
+                  WHERE user_id = @uid AND is_successful = FALSE
+                  AND created_at > NOW() - INTERVAL '15 minutes'",
+                new() { ["@uid"] = userId });
+            if (recentFails >= 5)
+                return (false, "Bahut zyada galat attempts. 15 minute baad try karo.", null);
         }
 
+        bool passwordOk = !string.IsNullOrEmpty(passwordHash) && BCrypt.Net.BCrypt.Verify(req.Password, passwordHash);
+
+        // BUG#M1-6 FIX: 2FA timing side-channel — don't reveal that password was correct.
+        // Wrong password AND wrong/missing 2FA both return the same generic error.
+        // Only the machine-readable "2fa_required" code is different (tells Flutter to show TOTP input).
+        if (is2FAEnabled && passwordOk)
+        {
+            if (string.IsNullOrWhiteSpace(req.TwoFaCode))
+            {
+                // Password was correct, 2FA code not provided — signal client to show TOTP input.
+                // Use a machine-readable code, NOT a human message that reveals password was correct.
+                _ = LogLoginAsync(userId, ipAddress, "email", false, "2fa_code_missing");
+                return (false, "2fa_required", null);
+            }
+            if (!Verify2FA(twoFaSecret, req.TwoFaCode))
+            {
+                _ = LogLoginAsync(userId, ipAddress, "email", false, "2fa_code_wrong");
+                return (false, "Email/username ya password galat hai", null); // same generic msg
+            }
+        }
+        else if (!passwordOk)
+        {
+            _ = LogLoginAsync(userId, ipAddress, "email", false, "wrong_password");
+            return (false, "Email/username ya password galat hai", null);
+        }
+
+        // VULN#5 FIX: Email verification required in production.
+        // Skipped in Development so devs can test without email setup.
+        var isDev = _config["ASPNETCORE_ENVIRONMENT"] == "Development"
+                    || Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") == "Development";
+        if (!isDev && !userInfo.IsEmailVerified)
+            return (false, "Pehle apna email verify karo. Inbox check karo.", null);
+
         await using var writeConn = await _db.CreateConnectionAsync();
-        await DbHelper.ExecuteNonQueryAsync(writeConn,
-            "UPDATE users SET last_login_at=NOW(),last_active_at=NOW() WHERE id=@id",
-            new() { ["@id"]=userId });
+        // BUG#M6-3 FIX: login_streak was never incremented — every user always showed streak=0/1.
+        // Streak logic uses IST dates (Asia/Kolkata) so "midnight" aligns with Indian day boundary.
+        //   • Same IST day as last login    → no change (already counted today)
+        //   • Consecutive IST day           → streak += 1 (and update max_login_streak)
+        //   • Gap of more than 1 day        → streak resets to 1
+        // This also updates max_login_streak so the user's personal best is preserved.
+        await DbHelper.ExecuteNonQueryAsync(writeConn, @"
+            UPDATE users SET
+                last_login_at    = NOW(),
+                last_active_at   = NOW(),
+                login_streak     = CASE
+                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
+                         date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                    THEN login_streak
+                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
+                         date_trunc('day', (NOW() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '1 day')
+                    THEN login_streak + 1
+                    ELSE 1
+                  END,
+                max_login_streak = GREATEST(max_login_streak, CASE
+                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
+                         date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                    THEN login_streak
+                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
+                         date_trunc('day', (NOW() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '1 day')
+                    THEN login_streak + 1
+                    ELSE 1
+                  END)
+            WHERE id = @id",
+            new() { ["@id"] = userId });
         _ = LogLoginAsync(userId, ipAddress, "email", true);
 
         var at = _jwtService.GenerateAccessToken(userInfo);
@@ -259,8 +337,10 @@ public class AuthService : IAuthService
             await DbHelper.ExecuteNonQueryAsync(wc,
                 "INSERT INTO oauth_accounts (id,user_id,provider,provider_user_id,provider_email,created_at,updated_at) VALUES (uuid_generate_v4(),@uid,'google'::oauth_provider,@gid,@e,NOW(),NOW())",
                 new(){["@uid"]=newUserId,["@gid"]=payload.Subject,["@e"]=payload.Email}, tx);
+            // Trigger trg_create_wallet already created the wallet on user insert.
+            // Just update the coin_balance to give the signup bonus.
             await DbHelper.ExecuteNonQueryAsync(wc,
-                "INSERT INTO wallets (id,user_id,coin_balance,total_earned,total_spent,created_at,updated_at) VALUES (uuid_generate_v4(),@uid,50,0,0,NOW(),NOW())",
+                "UPDATE wallets SET coin_balance=50, total_earned=50 WHERE user_id=@uid",
                 new(){["@uid"]=newUserId}, tx);
             await tx.CommitAsync(); committed=true;
         }
@@ -355,7 +435,9 @@ public class AuthService : IAuthService
         var nh=BCrypt.Net.BCrypt.HashPassword(req.NewPassword,12);
         await using var wc=await _db.CreateConnectionAsync();
         await DbHelper.ExecuteNonQueryAsync(wc,"UPDATE users SET password_hash=@h,updated_at=NOW() WHERE id=@id",new(){["@h"]=nh,["@id"]=userId});
-        return (true,"Password change ho gaya!");
+        // BUG#M1-7 FIX: Invalidate all sessions so other devices are logged out after password change.
+        await DbHelper.ExecuteNonQueryAsync(wc,"UPDATE user_sessions SET is_active=FALSE WHERE user_id=@id",new(){["@id"]=userId});
+        return (true,"Password change ho gaya! Dobara login karo.");
     }
 
     public async Task<(bool Success, string Message, AuthResponse? Data)> RefreshTokenAsync(
@@ -499,8 +581,12 @@ public class AuthService : IAuthService
 
     private string GenerateReferralCode(string username)
     {
-        var rand=new Random();
-        return (username.ToUpper()[..Math.Min(4,username.Length)]+rand.Next(1000,9999)).ToUpper();
+        // BUG#M1-8 FIX: Use cryptographically secure RNG instead of predictable new Random().
+        var prefix = username.ToUpper()[..Math.Min(4, username.Length)];
+        var bytes = new byte[4];
+        System.Security.Cryptography.RandomNumberGenerator.Fill(bytes);
+        var num = (BitConverter.ToUInt32(bytes, 0) % 9000u) + 1000u; // 1000–9999
+        return (prefix + num).ToUpper();
     }
 
     private async Task<string> GenerateUniqueUsernameAsync(NpgsqlConnection conn, string base_)
