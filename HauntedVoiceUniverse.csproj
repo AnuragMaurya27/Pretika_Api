@@ -14,7 +14,7 @@
     <PackageReference Include="Npgsql" Version="9.0.2" />
 
     <!-- JWT Authentication - versions match honi chahiye -->
-    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0-preview.3.25172.1" />
+   <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.0" />
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.0.1" />
 
     <!-- Google OAuth -->
