@@ -231,6 +231,7 @@ if (app.Environment.IsDevelopment())
 app.UseIpRateLimiting();
 app.UseCors();
 app.UseStaticFiles(); // ✅ Avatar/Cover images serve karega: /uploads/avatars/...
+
 app.UseAuthentication();
 // BUG#A5 FIX: Check user's account status (ban/suspend) on every authenticated request.
 // JWT stays valid after ban unless we check the DB — this middleware closes that gap.

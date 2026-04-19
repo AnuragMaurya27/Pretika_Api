@@ -60,3 +60,9 @@
 /Users/anuragkivani/Downloads/HauntedVoiceUniverse/obj/Debug/net8.0/HauntedVoiceUniverse.pdb
 /Users/anuragkivani/Downloads/HauntedVoiceUniverse/obj/Debug/net8.0/HauntedVoiceUniverse.genruntimeconfig.cache
 /Users/anuragkivani/Downloads/HauntedVoiceUniverse/obj/Debug/net8.0/ref/HauntedVoiceUniverse.dll
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net8.0/out/web.config
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net8.0/out/appsettings.Development.json
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net8.0/out/appsettings.json
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net8.0/out/HauntedVoiceUniverse.deps.json
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net8.0/out/HauntedVoiceUniverse.runtimeconfig.json
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net8.0/out/HauntedVoiceUniverse.staticwebassets.endpoints.json

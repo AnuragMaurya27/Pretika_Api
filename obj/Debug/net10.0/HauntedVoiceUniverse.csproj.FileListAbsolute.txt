@@ -73,3 +73,9 @@
 /Users/anuragkivani/Downloads/HauntedVoiceUniverse/obj/Debug/net10.0/compressed/gtrhtjs3v1-{0}-45qoge2lhy-45qoge2lhy.gz
 /Users/anuragkivani/Downloads/HauntedVoiceUniverse/obj/Debug/net10.0/compressed/r46mopdc88-{0}-y3jlgfi6xb-y3jlgfi6xb.gz
 /Users/anuragkivani/Downloads/HauntedVoiceUniverse/obj/Debug/net10.0/compressed/l9xkwnfr7i-{0}-oi3or1actg-oi3or1actg.gz
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net10.0/out/web.config
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net10.0/out/appsettings.Development.json
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net10.0/out/appsettings.json
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net10.0/out/HauntedVoiceUniverse.deps.json
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net10.0/out/HauntedVoiceUniverse.runtimeconfig.json
+/Users/anuragkivani/Downloads/HauntedVoiceUniverse/bin/Debug/net10.0/out/HauntedVoiceUniverse.staticwebassets.endpoints.json

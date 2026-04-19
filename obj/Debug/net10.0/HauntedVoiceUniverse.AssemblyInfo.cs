@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("HauntedVoiceUniverse")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+08cd2dd61c424f055c0c52236dd142dfebff4f24")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+2433dd1246f30e70f8e37cdb0dd87bda14a5f6c2")]
 [assembly: System.Reflection.AssemblyProductAttribute("HauntedVoiceUniverse")]
 [assembly: System.Reflection.AssemblyTitleAttribute("HauntedVoiceUniverse")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
