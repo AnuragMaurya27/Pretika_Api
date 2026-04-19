@@ -6,6 +6,8 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 
+// Fix for Render inotify limit crash (FileSystemWatcher)
+Environment.SetEnvironmentVariable("DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE", "false");
 var builder = WebApplication.CreateBuilder(args);
 
 // ─── 1. Controllers ───────────────────────────────────────────────────────────
