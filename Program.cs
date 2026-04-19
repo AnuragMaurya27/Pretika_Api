@@ -91,6 +91,14 @@ builder.Services.AddCors(opt =>
     opt.AddDefaultPolicy(policy =>
     {
         policy.WithOrigins(allowedCorsOrigins)
+              .SetIsOriginAllowed(origin => 
+              {
+                  if (allowedCorsOrigins.Contains(origin)) return true;
+                  try {
+                      var host = new Uri(origin).Host;
+                      return host.EndsWith(".vercel.app") || host == "vercel.app";
+                  } catch { return false; }
+              })
               .AllowAnyHeader()
               .AllowAnyMethod()
               .AllowCredentials();
