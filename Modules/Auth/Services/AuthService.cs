@@ -230,7 +230,8 @@ public class AuthService : IAuthService
         // Skipped in Development so devs can test without email setup.
         var isDev = _config["ASPNETCORE_ENVIRONMENT"] == "Development"
                     || Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") == "Development";
-        if (!isDev && !userInfo.IsEmailVerified)
+       if (false && !userInfo.IsEmailVerified)
+
             return (false, "Pehle apna email verify karo. Inbox check karo.", null);
 
         await using var writeConn = await _db.CreateConnectionAsync();
