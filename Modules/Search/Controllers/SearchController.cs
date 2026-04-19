@@ -19,7 +19,7 @@ public class SearchController : ControllerBase
     }
 
     private Guid? CurrentUserId =>
-        Guid.TryParse(User.FindFirstValue(ClaimTypes.NameIdentifier), out var id) ? id : null;
+        Guid.TryParse(User.FindFirstValue(HvuClaims.UserId), out var id) ? id : null;
 
     // ─── UNIFIED SEARCH ───────────────────────────────────────────────────────
     /// <summary>

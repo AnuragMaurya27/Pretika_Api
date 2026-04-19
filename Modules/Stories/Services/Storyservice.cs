@@ -170,6 +170,7 @@ public class StoryService : IStoryService
         if (req.Language != null) { updates.Add("language=@lang::content_language"); p["@lang"] = req.Language.ToLower(); }
         if (req.AgeRating != null) { updates.Add("age_rating=@age::age_rating"); p["@age"] = req.AgeRating.ToLower(); }
         if (req.ThumbnailUrl != null) { updates.Add("thumbnail_url=@thumb"); p["@thumb"] = req.ThumbnailUrl.Trim() == "" ? (object)DBNull.Value : req.ThumbnailUrl.Trim(); }
+        if (req.ThumbnailData != null) { updates.Add("thumbnail_data=@thumbData::jsonb"); p["@thumbData"] = req.ThumbnailData.Trim() == "" ? (object)DBNull.Value : req.ThumbnailData.Trim(); }
 
         if (updates.Count > 0)
         {
@@ -262,8 +263,9 @@ public class StoryService : IStoryService
             // Previously no status filter existed, leaking premium draft content to anyone
             // who knew the story UUID (e.g., from API responses, browser history, etc.).
             using var cmd = new NpgsqlCommand(@"
-                SELECT s.id, s.title, s.slug, s.summary, s.thumbnail_url, s.story_type,
-                       s.language, s.age_rating, s.status, s.creator_id,
+                SELECT s.id, s.title, s.slug, s.summary, s.thumbnail_url,
+                       s.thumbnail_data::text as thumbnail_data,
+                       s.story_type, s.language, s.age_rating, s.status, s.creator_id,
                        s.category_id, s.collection_id,
                        s.total_episodes, s.total_views, s.total_likes,
                        s.total_comments, s.total_bookmarks, s.engagement_score,
@@ -497,7 +499,8 @@ public class StoryService : IStoryService
                        s.published_at, s.created_at, s.updated_at,
                        u.username as creator_username, u.display_name as creator_display_name,
                        u.avatar_url as creator_avatar_url, u.is_verified_creator,
-                       c.name as category_name, sc.name as collection_name
+                       c.name as category_name, sc.name as collection_name,
+                       COALESCE((SELECT ROUND(AVG(rating)::numeric,1) FROM story_ratings WHERE story_id=s.id), 0) as average_rating
                 FROM stories s
                 JOIN users u ON u.id=s.creator_id
                 LEFT JOIN categories c ON c.id=s.category_id
@@ -566,7 +569,8 @@ public class StoryService : IStoryService
                    s.published_at, s.created_at, s.updated_at,
                    u.username as creator_username, u.display_name as creator_display_name,
                    u.avatar_url as creator_avatar_url, u.is_verified_creator,
-                   c.name as category_name, sc.name as collection_name
+                   c.name as category_name, sc.name as collection_name,
+                   COALESCE((SELECT ROUND(AVG(rating)::numeric,1) FROM story_ratings WHERE story_id=s.id), 0) as average_rating
             FROM stories s
             JOIN users u ON u.id=s.creator_id
             LEFT JOIN categories c ON c.id=s.category_id
@@ -612,7 +616,8 @@ public class StoryService : IStoryService
                        s.published_at, s.created_at, s.updated_at,
                        u.username as creator_username, u.display_name as creator_display_name,
                        u.avatar_url as creator_avatar_url, u.is_verified_creator,
-                       c.name as category_name, sc.name as collection_name
+                       c.name as category_name, sc.name as collection_name,
+                       COALESCE((SELECT ROUND(AVG(rating)::numeric,1) FROM story_ratings WHERE story_id=s.id), 0) as average_rating
                 FROM stories s JOIN users u ON u.id=s.creator_id
                 LEFT JOIN categories c ON c.id=s.category_id
                 LEFT JOIN story_collections sc ON sc.id = s.collection_id
@@ -1066,7 +1071,8 @@ public class StoryService : IStoryService
                    s.published_at, s.created_at, s.updated_at,
                    u.username as creator_username, u.display_name as creator_display_name,
                    u.avatar_url as creator_avatar_url, u.is_verified_creator,
-                   c.name as category_name, sc.name as collection_name
+                   c.name as category_name, sc.name as collection_name,
+                   COALESCE((SELECT ROUND(AVG(rating)::numeric,1) FROM story_ratings WHERE story_id=s.id), 0) as average_rating
             FROM bookmarks b
             JOIN stories s ON s.id=b.story_id
             JOIN users u ON u.id=s.creator_id
@@ -1274,17 +1280,23 @@ public class StoryService : IStoryService
         await using var conn = await _db.CreateConnectionAsync();
 
         using var cmd = new NpgsqlCommand(
-            "SELECT id, name, slug, description, icon_url FROM categories WHERE is_active=TRUE ORDER BY display_order ASC, name ASC",
+            @"SELECT id, name, slug, description, icon_url,
+                     (SELECT COUNT(1) FROM stories
+                      WHERE category_id=c.id AND status='published'::story_status AND deleted_at IS NULL) AS total_stories
+              FROM categories c
+              WHERE is_active=TRUE
+              ORDER BY display_order ASC, name ASC",
             conn);
         using var reader = await cmd.ExecuteReaderAsync();
         while (await reader.ReadAsync())
             results.Add(new CategoryResponse
             {
-                Id          = DbHelper.GetGuid(reader, "id"),
-                Name        = DbHelper.GetString(reader, "name"),
-                Slug        = DbHelper.GetStringOrNull(reader, "slug"),
-                Description = DbHelper.GetStringOrNull(reader, "description"),
-                IconUrl     = DbHelper.GetStringOrNull(reader, "icon_url")
+                Id           = DbHelper.GetGuid(reader, "id"),
+                Name         = DbHelper.GetString(reader, "name"),
+                Slug         = DbHelper.GetStringOrNull(reader, "slug"),
+                Description  = DbHelper.GetStringOrNull(reader, "description"),
+                IconUrl      = DbHelper.GetStringOrNull(reader, "icon_url"),
+                TotalStories = (int)reader.GetInt64(reader.GetOrdinal("total_stories"))
             });
 
         return results;
@@ -1546,6 +1558,7 @@ public class StoryService : IStoryService
         TotalBookmarks      = DbHelper.GetLong(r, "total_bookmarks"),
         EngagementScore     = DbHelper.GetDecimal(r, "engagement_score"),
         IsEditorPick        = DbHelper.GetBool(r, "is_editor_pick"),
+        AverageRating       = (double)DbHelper.GetDecimal(r, "average_rating"),
         PublishedAt         = DbHelper.GetDateTimeOrNull(r, "published_at"),
         CreatedAt           = DbHelper.GetDateTime(r, "created_at"),
         UpdatedAt           = DbHelper.GetDateTime(r, "updated_at")
@@ -1558,6 +1571,7 @@ public class StoryService : IStoryService
         Slug                = DbHelper.GetString(r, "slug"),
         Summary             = DbHelper.GetStringOrNull(r, "summary"),
         ThumbnailUrl        = DbHelper.GetStringOrNull(r, "thumbnail_url"),
+        ThumbnailData       = DbHelper.GetStringOrNull(r, "thumbnail_data"),
         StoryType           = DbHelper.GetString(r, "story_type"),
         Language            = DbHelper.GetString(r, "language"),
         AgeRating           = DbHelper.GetString(r, "age_rating"),
@@ -1769,7 +1783,8 @@ public class StoryService : IStoryService
                    s.published_at, s.created_at, s.updated_at,
                    u.username as creator_username, u.display_name as creator_display_name,
                    u.avatar_url as creator_avatar_url, u.is_verified_creator,
-                   c.name as category_name, sc.name as collection_name
+                   c.name as category_name, sc.name as collection_name,
+                   COALESCE((SELECT ROUND(AVG(rating)::numeric,1) FROM story_ratings WHERE story_id=s.id), 0) as average_rating
             FROM stories s
             JOIN users u ON u.id=s.creator_id
             LEFT JOIN categories c ON c.id=s.category_id

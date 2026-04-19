@@ -53,6 +53,26 @@ public class WalletController : ControllerBase
         return Ok(ApiResponse<List<RechargePackResponse>>.Ok(packs));
     }
 
+    // GET /api/wallet/appreciation-stickers
+    /// <summary>Appreciation sticker catalog</summary>
+    [HttpGet("appreciation-stickers")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetAppreciationStickers()
+    {
+        var stickers = await _walletService.GetAppreciationStickersAsync();
+        return Ok(ApiResponse<List<AppreciationStickerResponse>>.Ok(stickers));
+    }
+
+    // GET /api/wallet/story/{storyId}/appreciations
+    /// <summary>Story ki total appreciation stats</summary>
+    [HttpGet("story/{storyId:guid}/appreciations")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetStoryAppreciations(Guid storyId)
+    {
+        var result = await _walletService.GetStoryAppreciationsAsync(storyId);
+        return Ok(ApiResponse<StoryAppreciationsResponse>.Ok(result));
+    }
+
     // POST /api/wallet/recharge/initiate
     /// <summary>Recharge initiate karo (order create)</summary>
     [HttpPost("recharge/initiate")]

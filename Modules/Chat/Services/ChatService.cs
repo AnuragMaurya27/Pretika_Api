@@ -98,23 +98,63 @@ public class ChatService : IChatService
         return await DbHelper.ExecuteReaderAsync(conn,
             @"SELECT cr.id, cr.room_type, cr.last_message_at,
                      CASE WHEN cr.user1_id = @uid THEN cr.user2_id ELSE cr.user1_id END as other_user_id,
-                     u.username as other_username, u.avatar_url as other_avatar_url
+                     u.username as other_username, u.avatar_url as other_avatar_url,
+                     lm.id          as lm_id,
+                     lm.room_id     as lm_room_id,
+                     lm.sender_id   as lm_sender_id,
+                     lm.message_type as lm_message_type,
+                     lm.content     as lm_content,
+                     lm.image_url   as lm_image_url,
+                     lm.sticker_id  as lm_sticker_id,
+                     lm.is_super_chat       as lm_is_super_chat,
+                     lm.super_chat_coins    as lm_super_chat_coins,
+                     lm.is_deleted          as lm_is_deleted,
+                     lm.is_system_message   as lm_is_system_message,
+                     lm.created_at          as lm_created_at
               FROM chat_rooms cr
               JOIN users u ON u.id = CASE WHEN cr.user1_id = @uid THEN cr.user2_id ELSE cr.user1_id END
+              LEFT JOIN LATERAL (
+                  SELECT cm.id, cm.room_id, cm.sender_id, cm.message_type, cm.content,
+                         cm.image_url, cm.sticker_id, cm.is_super_chat, cm.super_chat_coins,
+                         cm.is_deleted, cm.is_system_message, cm.created_at
+                  FROM chat_messages cm
+                  WHERE cm.room_id = cr.id AND cm.is_deleted = FALSE
+                  ORDER BY cm.created_at DESC
+                  LIMIT 1
+              ) lm ON TRUE
               WHERE cr.room_type = 'private'
                 AND (cr.user1_id = @uid OR cr.user2_id = @uid)
                 AND cr.is_active = TRUE
               ORDER BY cr.last_message_at DESC NULLS LAST",
-            r => new ChatRoomResponse
+            r =>
             {
-                Id = DbHelper.GetGuid(r, "id"),
-                RoomType = DbHelper.GetString(r, "room_type"),
-                LastMessageAt = DbHelper.GetDateTimeOrNull(r, "last_message_at"),
-                OtherUserId = DbHelper.GetGuid(r, "other_user_id"),
-                OtherUsername = DbHelper.GetString(r, "other_username"),
-                OtherAvatarUrl = DbHelper.GetStringOrNull(r, "other_avatar_url"),
-                IsMember = true,
-                IsActive = true
+                var hasLastMsg = !r.IsDBNull(r.GetOrdinal("lm_id"));
+                return new ChatRoomResponse
+                {
+                    Id = DbHelper.GetGuid(r, "id"),
+                    RoomType = DbHelper.GetString(r, "room_type"),
+                    LastMessageAt = DbHelper.GetDateTimeOrNull(r, "last_message_at"),
+                    OtherUserId = DbHelper.GetGuid(r, "other_user_id"),
+                    OtherUsername = DbHelper.GetString(r, "other_username"),
+                    OtherAvatarUrl = DbHelper.GetStringOrNull(r, "other_avatar_url"),
+                    IsMember = true,
+                    IsActive = true,
+                    LastMessage = hasLastMsg ? new ChatMessageResponse
+                    {
+                        Id = r.GetGuid(r.GetOrdinal("lm_id")),
+                        RoomId = r.GetGuid(r.GetOrdinal("lm_room_id")),
+                        SenderId = r.GetGuid(r.GetOrdinal("lm_sender_id")),
+                        MessageType = DbHelper.GetString(r, "lm_message_type"),
+                        Content = DbHelper.GetStringOrNull(r, "lm_content"),
+                        ImageUrl = DbHelper.GetStringOrNull(r, "lm_image_url"),
+                        StickerId = DbHelper.GetStringOrNull(r, "lm_sticker_id"),
+                        IsSuperChat = DbHelper.GetBool(r, "lm_is_super_chat"),
+                        SuperChatCoins = DbHelper.GetInt(r, "lm_super_chat_coins"),
+                        IsDeleted = DbHelper.GetBool(r, "lm_is_deleted"),
+                        IsSystemMessage = DbHelper.GetBool(r, "lm_is_system_message"),
+                        CreatedAt = DbHelper.GetDateTime(r, "lm_created_at")
+                    } : null
+                };
             },
             new Dictionary<string, object?> { ["uid"] = userId });
     }

@@ -56,12 +56,24 @@ public class AppreciateRequest
     public Guid? StoryId { get; set; }
     public Guid? EpisodeId { get; set; }
 
-    [Required]
     [Range(1, 10000)]
-    public int CoinAmount { get; set; }
+    public int? CoinAmount { get; set; }
+
+    [StringLength(100)]
+    public string? StickerId { get; set; }
 
     [StringLength(200)]
     public string? Message { get; set; }
+}
+
+public class AppreciationStickerResponse
+{
+    public string Id { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string Language { get; set; } = "";
+    public int CoinAmount { get; set; }
+    public string ImageUrl { get; set; } = "";
+    public int DisplayOrder { get; set; }
 }
 
 public class AppreciationResponse
@@ -71,6 +83,28 @@ public class AppreciationResponse
     public string ReceiverUsername { get; set; } = "";
     public int CoinAmount { get; set; }
     public string? Message { get; set; }
+    public string? StickerId { get; set; }
+    public string? StickerName { get; set; }
+    public string? StickerImageUrl { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+public class StoryAppreciationsResponse
+{
+    public long TotalCoins { get; set; }
+    public int TotalCount { get; set; }
+    public List<AppreciationSenderResponse> RecentSenders { get; set; } = new();
+}
+
+public class AppreciationSenderResponse
+{
+    public Guid SenderId { get; set; }
+    public string SenderUsername { get; set; } = "";
+    public string? SenderDisplayName { get; set; }
+    public string? SenderAvatarUrl { get; set; }
+    public int CoinAmount { get; set; }
+    public string? StickerId { get; set; }
+    public string? StickerImageUrl { get; set; }
     public DateTime CreatedAt { get; set; }
 }
 

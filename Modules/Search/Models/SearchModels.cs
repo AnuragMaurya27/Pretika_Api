@@ -39,6 +39,8 @@ public class SearchUserResult
     public int TotalFollowers { get; set; }
     public int TotalStories { get; set; }
     public string? Bio { get; set; }
+    public bool IsFollowing { get; set; }
+    public bool IsFollowedByThem { get; set; }
 }
 
 // ─── Unified Search Response ──────────────────────────────────────────────────

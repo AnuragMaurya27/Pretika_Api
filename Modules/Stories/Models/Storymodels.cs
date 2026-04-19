@@ -60,6 +60,9 @@ public class StoryResponse
 public class StoryDetailResponse : StoryResponse
 {
     public List<EpisodeResponse> Episodes { get; set; } = new();
+    /// Raw JSON stored in thumbnail_data JSONB column — used by the Flutter
+    /// editor to restore the text overlay for cross-device re-editing.
+    public string? ThumbnailData { get; set; }
 }
 
 public class RateStoryRequest
@@ -156,6 +159,9 @@ public class UpdateStoryRequest
     public string? AgeRating { get; set; }
     public List<string>? Tags { get; set; }
     public string? ThumbnailUrl { get; set; }
+    /// Optional JSON blob persisting the cover editor's raw image URL + text
+    /// overlay state so creators can re-edit from any device.
+    public string? ThumbnailData { get; set; }
 }
 
 public class CreateEpisodeRequest

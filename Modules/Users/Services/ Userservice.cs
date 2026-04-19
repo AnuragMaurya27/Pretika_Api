@@ -52,15 +52,16 @@ public class UserService : IUserService
             // referral_code (enables targeted referral abuse), last_active_at (stalking risk),
             // total_coins_earned (financial info visible to strangers).
             using var cmd = new NpgsqlCommand(@"
-                SELECT id, username, display_name, bio, avatar_url, cover_image_url,
-                       role, is_creator, is_verified_creator, is_email_verified,
-                       reader_fear_rank, creator_fear_rank, creator_rank_score, reader_rank_score,
-                       preferred_language, total_followers, total_following,
-                       total_stories_published, total_views_received,
-                       created_at, status
-                FROM users
-                WHERE LOWER(username) = LOWER(@username)
-                  AND deleted_at IS NULL", conn);
+                SELECT u.id, u.username, u.display_name, u.bio, u.avatar_url, u.cover_image_url,
+                       u.role, u.is_creator, u.is_verified_creator, u.is_email_verified,
+                       u.reader_fear_rank, u.creator_fear_rank, u.creator_rank_score, u.reader_rank_score,
+                       u.preferred_language, u.total_followers, u.total_following,
+                       u.total_stories_published,
+                       COALESCE((SELECT SUM(s.total_views) FROM stories s WHERE s.creator_id = u.id AND s.deleted_at IS NULL), 0) AS total_views_received,
+                       u.created_at, u.status
+                FROM users u
+                WHERE LOWER(u.username) = LOWER(@username)
+                  AND u.deleted_at IS NULL", conn);
             cmd.Parameters.AddWithValue("@username", username);
 
             using var reader = await cmd.ExecuteReaderAsync();

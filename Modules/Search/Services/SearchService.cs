@@ -92,8 +92,12 @@ public class SearchService : ISearchService
                 @"SELECT u.id, u.username, u.display_name, u.avatar_url, u.bio,
                          u.is_creator, u.is_verified_creator,
                          u.reader_fear_rank, u.creator_fear_rank,
-                         u.total_followers, u.total_stories_published
+                         u.total_followers, u.total_stories_published,
+                         CASE WHEN f1.id IS NOT NULL THEN TRUE ELSE FALSE END as is_following,
+                         CASE WHEN f2.id IS NOT NULL THEN TRUE ELSE FALSE END as is_followed_by_them
                   FROM users u
+                  LEFT JOIN follows f1 ON f1.follower_id = @viewerId AND f1.following_id = u.id
+                  LEFT JOIN follows f2 ON f2.follower_id = u.id AND f2.following_id = @viewerId
                   WHERE u.deleted_at IS NULL
                     AND u.status NOT IN ('shadow_banned','banned','suspended')
                     AND (LOWER(u.username) LIKE @q OR LOWER(u.display_name) LIKE @q OR LOWER(u.bio) LIKE @q)
@@ -112,12 +116,15 @@ public class SearchService : ISearchService
                     CreatorFearRank = DbHelper.GetStringOrNull(r, "creator_fear_rank"),
                     TotalFollowers  = DbHelper.GetInt(r, "total_followers"),
                     TotalStories    = DbHelper.GetInt(r, "total_stories_published"),
+                    IsFollowing     = DbHelper.GetBool(r, "is_following"),
+                    IsFollowedByThem = DbHelper.GetBool(r, "is_followed_by_them"),
                 },
                 new()
                 {
-                    ["@q"]   = pattern,
-                    ["@lim"] = userLimit,
-                    ["@off"] = userOffset,
+                    ["@q"]       = pattern,
+                    ["@lim"]     = userLimit,
+                    ["@off"]     = userOffset,
+                    ["@viewerId"] = (object?)viewerId ?? DBNull.Value,
                 });
 
             if (searchType == "all")

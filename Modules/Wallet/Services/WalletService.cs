@@ -15,10 +15,12 @@ public interface IWalletService
     Task EnsureWalletExistsAsync(Guid userId);
     Task<PagedResult<TransactionResponse>> GetTransactionsAsync(Guid userId, int page, int pageSize, string? type);
     Task<List<RechargePackResponse>> GetRechargePacksAsync();
+    Task<List<AppreciationStickerResponse>> GetAppreciationStickersAsync();
     Task<(bool Success, string Message, InitiateRechargeResponse? Data)> InitiateRechargeAsync(Guid userId, InitiateRechargeRequest req);
     Task<(bool Success, string Message)> VerifyRechargeAsync(Guid userId, VerifyRechargeRequest req);
     Task<(bool Success, string Message, AppreciationResponse? Data)> AppreciateAsync(Guid senderId, AppreciateRequest req);
     Task<(bool Success, string Message, WithdrawalResponse? Data)> RequestWithdrawalAsync(Guid userId, WithdrawalRequest req);
+    Task<StoryAppreciationsResponse> GetStoryAppreciationsAsync(Guid storyId);
     Task<PagedResult<WithdrawalResponse>> GetWithdrawalHistoryAsync(Guid userId, int page, int pageSize);
 }
 
@@ -144,6 +146,11 @@ public class WalletService : IWalletService
                 IsPopular = DbHelper.GetBool(r, "is_popular"),
                 DisplayOrder = DbHelper.GetInt(r, "display_order")
             });
+    }
+
+    public Task<List<AppreciationStickerResponse>> GetAppreciationStickersAsync()
+    {
+        return Task.FromResult(AppreciationStickerCatalog.ToResponses());
     }
 
     public async Task<(bool Success, string Message, InitiateRechargeResponse? Data)> InitiateRechargeAsync(Guid userId, InitiateRechargeRequest req)
@@ -333,6 +340,32 @@ public class WalletService : IWalletService
     {
         if (req.ReceiverId == senderId) return (false, "Apne aap ko appreciate nahi kar sakte", null);
 
+        var sticker = AppreciationStickerCatalog.Find(req.StickerId);
+        if (!string.IsNullOrWhiteSpace(req.StickerId) && sticker == null)
+            return (false, "Sticker catalog invalid hai", null);
+
+        var effectiveCoinAmount = sticker?.CoinAmount ?? req.CoinAmount ?? 0;
+        if (effectiveCoinAmount <= 0)
+            return (false, "Coin amount ya sticker select karo", null);
+
+        var isStickerAppreciation = sticker != null;
+        var effectiveMessage = sticker != null
+            ? $"sticker:{sticker.Id}"
+            : string.IsNullOrWhiteSpace(req.Message)
+                ? null
+                : req.Message.Trim();
+        var description = sticker != null
+            ? $"Sticker appreciation: {sticker.Name} ({effectiveCoinAmount} coins)"
+            : $"Appreciation: {effectiveCoinAmount} coins";
+        var referenceType = req.EpisodeId.HasValue
+            ? "episode"
+            : req.StoryId.HasValue
+                ? "story"
+                : null;
+        var referenceId = req.EpisodeId ?? req.StoryId;
+
+        await EnsureWalletExistsAsync(senderId);
+
         using var conn = await _db.CreateConnectionAsync();
         using var transaction = await conn.BeginTransactionAsync();
 
@@ -346,7 +379,7 @@ public class WalletService : IWalletService
 
             if (senderWallet == null) return (false, "Wallet nahi mila", null);
             if (senderWallet.IsFrozen) return (false, "Aapka wallet freeze hai", null);
-            if (senderWallet.Balance < req.CoinAmount) return (false, "Insufficient coins", null);
+            if (senderWallet.Balance < effectiveCoinAmount) return (false, "Insufficient coins", null);
 
             // BUG#7 FIX: Check receiver exists AND is active (not banned/suspended)
             var receiverStatus = await DbHelper.ExecuteReaderFirstAsync(conn,
@@ -378,17 +411,25 @@ public class WalletService : IWalletService
             if (circularExists)
             {
                 // Flag as suspicious but don't block — insert fraud alert
-                await DbHelper.ExecuteNonQueryAsync(conn,
-                    @"INSERT INTO fraud_alerts (user_id, alert_type, severity)
-                      VALUES (@uid, 'circular_appreciation', 'high')
-                      ON CONFLICT DO NOTHING",
-                    new Dictionary<string, object?> { ["uid"] = senderId });
+                try
+                {
+                    await DbHelper.ExecuteNonQueryAsync(conn,
+                        @"INSERT INTO fraud_alerts (id, user_id, alert_type, severity, details, is_resolved, created_at)
+                          VALUES (gen_random_uuid(), @uid, 'circular_appreciation', 'high'::report_severity, '{}'::jsonb, false, NOW())",
+                        new Dictionary<string, object?> { ["uid"] = senderId }, transaction);
+                }
+                catch { /* Logging failure should not block the appreciation */ }
             }
 
-            // Revenue split: 40% creator, 40% platform, 20% reward fund
-            long creatorShare = (long)(req.CoinAmount * 0.40m);
-            long platformShare = (long)(req.CoinAmount * 0.40m);
-            long rewardFundShare = req.CoinAmount - creatorShare - platformShare;
+            // Sticker appreciation is a direct transfer: creator gets full amount.
+            // Legacy free-form appreciation keeps the existing platform split.
+            long creatorShare = isStickerAppreciation
+                ? effectiveCoinAmount
+                : (long)(effectiveCoinAmount * 0.40m);
+            long platformShare = isStickerAppreciation
+                ? 0
+                : (long)(effectiveCoinAmount * 0.40m);
+            long rewardFundShare = effectiveCoinAmount - creatorShare - platformShare;
 
             // Create transaction record
             var txId = Guid.NewGuid();
@@ -406,19 +447,19 @@ public class WalletService : IWalletService
                     ["id"] = txId,
                     ["sid"] = senderId,
                     ["rid"] = req.ReceiverId,
-                    ["amount"] = req.CoinAmount,
+                    ["amount"] = effectiveCoinAmount,
                     ["cs"] = creatorShare,
                     ["ps"] = platformShare,
                     ["rfs"] = rewardFundShare,
-                    ["refType"] = req.StoryId.HasValue ? "story" : (object?)DBNull.Value,
-                    ["refId"] = (object?)req.StoryId ?? (object?)req.EpisodeId ?? DBNull.Value,
-                    ["desc"] = $"Appreciation: {req.CoinAmount} coins"
+                    ["refType"] = (object?)referenceType ?? DBNull.Value,
+                    ["refId"] = (object?)referenceId ?? DBNull.Value,
+                    ["desc"] = description
                 }, transaction);
 
             // Deduct from sender
             await DbHelper.ExecuteNonQueryAsync(conn,
                 "UPDATE wallets SET coin_balance = coin_balance - @amount, total_spent = total_spent + @amount, last_transaction_at = NOW(), updated_at = NOW() WHERE user_id = @uid",
-                new Dictionary<string, object?> { ["uid"] = senderId, ["amount"] = req.CoinAmount }, transaction);
+                new Dictionary<string, object?> { ["uid"] = senderId, ["amount"] = effectiveCoinAmount }, transaction);
 
             // Credit to receiver (only creator share)
             await DbHelper.ExecuteNonQueryAsync(conn,
@@ -432,9 +473,12 @@ public class WalletService : IWalletService
                 new Dictionary<string, object?> { ["uid"] = req.ReceiverId, ["amount"] = creatorShare }, transaction);
 
             // Update reward fund
-            await DbHelper.ExecuteNonQueryAsync(conn,
-                "UPDATE reward_fund_pool SET balance = balance + @amount, total_deposited = total_deposited + @amount, last_updated = NOW()",
-                new Dictionary<string, object?> { ["amount"] = rewardFundShare }, transaction);
+            if (rewardFundShare > 0)
+            {
+                await DbHelper.ExecuteNonQueryAsync(conn,
+                    "UPDATE reward_fund_pool SET balance = balance + @amount, total_deposited = total_deposited + @amount, last_updated = NOW()",
+                    new Dictionary<string, object?> { ["amount"] = rewardFundShare }, transaction);
+            }
 
             // Insert appreciation record
             var appId = Guid.NewGuid();
@@ -448,8 +492,8 @@ public class WalletService : IWalletService
                     ["rid"] = req.ReceiverId,
                     ["storyId"] = (object?)req.StoryId ?? DBNull.Value,
                     ["episodeId"] = (object?)req.EpisodeId ?? DBNull.Value,
-                    ["amount"] = req.CoinAmount,
-                    ["msg"] = (object?)req.Message ?? DBNull.Value,
+                    ["amount"] = effectiveCoinAmount,
+                    ["msg"] = (object?)effectiveMessage ?? DBNull.Value,
                     ["txId"] = txId
                 }, transaction);
 
@@ -458,7 +502,7 @@ public class WalletService : IWalletService
             {
                 await DbHelper.ExecuteNonQueryAsync(conn,
                     "UPDATE stories SET total_coins_earned = total_coins_earned + @amount WHERE id = @id",
-                    new Dictionary<string, object?> { ["id"] = req.StoryId.Value, ["amount"] = req.CoinAmount }, transaction);
+                    new Dictionary<string, object?> { ["id"] = req.StoryId.Value, ["amount"] = effectiveCoinAmount }, transaction);
             }
 
             await transaction.CommitAsync();
@@ -473,16 +517,73 @@ public class WalletService : IWalletService
                 Id = appId,
                 ReceiverId = req.ReceiverId,
                 ReceiverUsername = receiverUsername ?? "",
-                CoinAmount = req.CoinAmount,
-                Message = req.Message,
+                CoinAmount = effectiveCoinAmount,
+                Message = effectiveMessage,
+                StickerId = sticker?.Id,
+                StickerName = sticker?.Name,
+                StickerImageUrl = sticker?.ImageUrl,
                 CreatedAt = DateTime.UtcNow
             });
         }
-        catch
+        catch (Exception ex)
         {
             await transaction.RollbackAsync();
-            return (false, "Appreciation mein error aaya", null);
+            return (false, $"Appreciation mein error aaya: {ex.Message}", null);
         }
+    }
+
+    public async Task<StoryAppreciationsResponse> GetStoryAppreciationsAsync(Guid storyId)
+    {
+        using var conn = await _db.CreateConnectionAsync();
+
+        var totalCoins = await DbHelper.ExecuteScalarAsync<long>(conn,
+            "SELECT COALESCE(SUM(coin_amount), 0) FROM appreciations WHERE story_id = @sid",
+            new Dictionary<string, object?> { ["sid"] = storyId });
+
+        var totalCount = await DbHelper.ExecuteScalarAsync<long>(conn,
+            "SELECT COUNT(DISTINCT sender_id) FROM appreciations WHERE story_id = @sid",
+            new Dictionary<string, object?> { ["sid"] = storyId });
+
+        // DISTINCT ON: one row per sender (their most recent appreciation)
+        var senders = await DbHelper.ExecuteReaderAsync(conn,
+            @"SELECT DISTINCT ON (a.sender_id)
+                     a.sender_id, u.username, u.display_name, u.avatar_url,
+                     a.coin_amount, a.message, a.created_at
+              FROM appreciations a
+              JOIN users u ON u.id = a.sender_id
+              WHERE a.story_id = @sid
+              ORDER BY a.sender_id, a.created_at DESC
+              LIMIT 30",
+            r =>
+            {
+                var rawMessage = DbHelper.GetStringOrNull(r, "message");
+                string? stickerId = null;
+                string? stickerImageUrl = null;
+                if (rawMessage != null && rawMessage.StartsWith("sticker:"))
+                {
+                    stickerId = rawMessage["sticker:".Length..];
+                    stickerImageUrl = AppreciationStickerCatalog.Find(stickerId)?.ImageUrl;
+                }
+                return new AppreciationSenderResponse
+                {
+                    SenderId = DbHelper.GetGuid(r, "sender_id"),
+                    SenderUsername = DbHelper.GetString(r, "username"),
+                    SenderDisplayName = DbHelper.GetStringOrNull(r, "display_name"),
+                    SenderAvatarUrl = DbHelper.GetStringOrNull(r, "avatar_url"),
+                    CoinAmount = DbHelper.GetInt(r, "coin_amount"),
+                    StickerId = stickerId,
+                    StickerImageUrl = stickerImageUrl,
+                    CreatedAt = DbHelper.GetDateTime(r, "created_at"),
+                };
+            },
+            new Dictionary<string, object?> { ["sid"] = storyId });
+
+        return new StoryAppreciationsResponse
+        {
+            TotalCoins = totalCoins,
+            TotalCount = (int)totalCount,
+            RecentSenders = senders,
+        };
     }
 
     public async Task<(bool Success, string Message, WithdrawalResponse? Data)> RequestWithdrawalAsync(Guid userId, WithdrawalRequest req)
