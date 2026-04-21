@@ -41,8 +41,8 @@
     <!-- File Upload -->
     <PackageReference Include="CloudinaryDotNet" Version="1.26.2" />
 
-    
-  
+    <!-- Firebase Admin SDK (FCM push notifications) -->
+    <PackageReference Include="FirebaseAdmin" Version="3.1.0" />
 
   </ItemGroup>
 

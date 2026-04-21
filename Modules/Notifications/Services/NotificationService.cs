@@ -1,5 +1,6 @@
 using HauntedVoiceUniverse.Common;
 using HauntedVoiceUniverse.Infrastructure.Database;
+using HauntedVoiceUniverse.Infrastructure.Push;
 using HauntedVoiceUniverse.Modules.Notifications.Models;
 using Npgsql;
 
@@ -24,10 +25,12 @@ public interface INotificationService
 public class NotificationService : INotificationService
 {
     private readonly IDbConnectionFactory _db;
+    private readonly IFcmService _fcm;
 
-    public NotificationService(IDbConnectionFactory db)
+    public NotificationService(IDbConnectionFactory db, IFcmService fcm)
     {
         _db = db;
+        _fcm = fcm;
     }
 
     private static NotificationResponse MapNotification(NpgsqlDataReader r)
@@ -229,6 +232,17 @@ public class NotificationService : INotificationService
                     ["actionUrl"] = (object?)actionUrl ?? DBNull.Value,
                     ["imageUrl"] = (object?)imageUrl ?? DBNull.Value
                 });
+
+            // Fire FCM push (non-blocking, failure won't break main flow)
+            var fcmData = new Dictionary<string, string>
+            {
+                ["notification_type"] = type
+            };
+            if (!string.IsNullOrEmpty(actionUrl)) fcmData["action_url"] = actionUrl;
+            if (!string.IsNullOrEmpty(imageUrl)) fcmData["image_url"] = imageUrl;
+            if (actorId.HasValue) fcmData["actor_id"] = actorId.Value.ToString();
+
+            _ = _fcm.SendToUserAsync(userId, title, message, type, fcmData);
         }
         catch
         {

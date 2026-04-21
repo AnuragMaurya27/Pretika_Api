@@ -120,3 +120,9 @@ public class UpdateProfileRequest
 
     public string? PreferredLanguage { get; set; } // hindi/hinglish/english
 }
+public class RegisterDeviceRequest
+{
+    public string DeviceToken { get; set; } = "";
+    public string DeviceType { get; set; } = "android";
+    public string? AppVersion { get; set; }
+}

@@ -1,5 +1,6 @@
 using HauntedVoiceUniverse.Common;
 using HauntedVoiceUniverse.Infrastructure.Database;
+using HauntedVoiceUniverse.Infrastructure.Push;
 using HauntedVoiceUniverse.Modules.Chat.Hubs;
 using HauntedVoiceUniverse.Modules.Chat.Models;
 using Microsoft.AspNetCore.SignalR;
@@ -29,12 +30,14 @@ public class ChatService : IChatService
     private readonly IDbConnectionFactory _db;
     private readonly IConfiguration _config;
     private readonly IHubContext<ChatHub> _hub;
+    private readonly IFcmService _fcm;
 
-    public ChatService(IDbConnectionFactory db, IConfiguration config, IHubContext<ChatHub> hub)
+    public ChatService(IDbConnectionFactory db, IConfiguration config, IHubContext<ChatHub> hub, IFcmService fcm)
     {
         _db = db;
         _config = config;
         _hub = hub;
+        _fcm = fcm;
     }
 
     private static ChatMessageResponse MapMessage(NpgsqlDataReader r)
@@ -440,6 +443,9 @@ public class ChatService : IChatService
             // Broadcast to all connected clients in this room via SignalR
             _ = _hub.Clients.Group(roomId.ToString()).SendAsync("NewMessage", msgResponse);
 
+            // Send FCM push to recipient for private chats (non-blocking)
+            _ = SendPrivateChatPushAsync(conn, roomId, userId, senderUsername, senderDisplayName, req);
+
             return (true, "Message bheja", msgResponse);
         }
         catch
@@ -448,6 +454,48 @@ public class ChatService : IChatService
             await dbTx.RollbackAsync();
             return (false, "Message send karne mein error aaya. Coins deduct nahi hue.", null);
         }
+    }
+
+    private async Task SendPrivateChatPushAsync(
+        Npgsql.NpgsqlConnection conn, Guid roomId, Guid senderId,
+        string senderUsername, string senderDisplayName, SendMessageRequest req)
+    {
+        try
+        {
+            // Only send push for private rooms
+            var roomType = await DbHelper.ExecuteScalarAsync<string?>(conn,
+                "SELECT room_type FROM chat_rooms WHERE id = @id",
+                new Dictionary<string, object?> { ["id"] = roomId });
+            if (roomType != "private") return;
+
+            // Get the other user in the private room
+            var recipientId = await DbHelper.ExecuteScalarAsync<Guid?>(conn,
+                "SELECT CASE WHEN user1_id = @uid THEN user2_id ELSE user1_id END FROM chat_rooms WHERE id = @rid",
+                new Dictionary<string, object?> { ["uid"] = senderId, ["rid"] = roomId });
+            if (recipientId == null) return;
+
+            var displayName = string.IsNullOrEmpty(senderDisplayName) ? senderUsername : senderDisplayName;
+            var body = req.MessageType switch
+            {
+                "sticker" => "Sticker bheja",
+                "image"   => "Photo bheja",
+                _ => req.Content ?? ""
+            };
+            if (body.Length > 100) body = body[..100] + "...";
+
+            _ = _fcm.SendToUserAsync(
+                recipientId.Value,
+                displayName,
+                body,
+                "message",
+                new Dictionary<string, string>
+                {
+                    ["room_id"]    = roomId.ToString(),
+                    ["action_url"] = $"/chat/room/{roomId}",
+                    ["sender_username"] = senderUsername
+                });
+        }
+        catch { }
     }
 
     public async Task<(bool Success, string Message)> DeleteMessageAsync(Guid userId, Guid messageId)

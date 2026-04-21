@@ -152,6 +152,10 @@ builder.Services.AddHttpContextAccessor();
 // ─── 7b. SignalR ──────────────────────────────────────────────────────────────
 builder.Services.AddSignalR();
 
+// ─── 7c. FCM Push Notifications ───────────────────────────────────────────────
+builder.Services.AddSingleton<HauntedVoiceUniverse.Infrastructure.Push.IFcmService,
+                               HauntedVoiceUniverse.Infrastructure.Push.FcmService>();
+
 // ─── 8. Services Register ─────────────────────────────────────────────────────
 // Auth
 builder.Services.AddScoped<HauntedVoiceUniverse.Modules.Auth.Services.IAuthService,

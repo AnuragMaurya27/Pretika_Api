@@ -1,5 +1,6 @@
 using HauntedVoiceUniverse.Common;
 using HauntedVoiceUniverse.Infrastructure.Database;
+using HauntedVoiceUniverse.Infrastructure.Push;
 using HauntedVoiceUniverse.Modules.Users.Models;
 using Npgsql;
 
@@ -25,6 +26,7 @@ public interface IUserService
     Task<(bool Success, string Message, int CoinsAwarded)> BecomeCreatorAsync(Guid userId);
     Task<(bool Success, string Message)> CompleteOnboardingAsync(Guid userId);
     Task<ReferralStatsResponse> GetReferralStatsAsync(Guid userId);
+    Task<(bool Success, string Message)> RegisterDeviceAsync(Guid userId, string deviceToken, string deviceType, string appVersion);
 }
 
 public class UserService : IUserService
@@ -32,12 +34,14 @@ public class UserService : IUserService
     private readonly IDbConnectionFactory _db;
     private readonly IWebHostEnvironment _env;
     private readonly ILogger<UserService> _logger;
+    private readonly IFcmService _fcm;
 
-    public UserService(IDbConnectionFactory db, IWebHostEnvironment env, ILogger<UserService> logger)
+    public UserService(IDbConnectionFactory db, IWebHostEnvironment env, ILogger<UserService> logger, IFcmService fcm)
     {
         _db = db;
         _env = env;
         _logger = logger;
+        _fcm = fcm;
     }
 
     // ─── GET PUBLIC PROFILE ───────────────────────────────────────────────────
@@ -332,13 +336,42 @@ public class UserService : IUserService
             // Only send notification if a new row was actually inserted.
             if (inserted > 0)
             {
+                // Fetch follower username for personalized notification
+                var followerUsername = await DbHelper.ExecuteScalarAsync<string?>(conn,
+                    "SELECT username FROM users WHERE id = @id",
+                    new Dictionary<string, object?> { ["id"] = followerId });
+
                 await DbHelper.ExecuteNonQueryAsync(conn, @"
-                    INSERT INTO notifications (id, user_id, notification_type, actor_id, title, message, created_at)
-                    VALUES (uuid_generate_v4(), @targetId, 'follow'::notification_type, @followerId, 'New Follower', 'Someone started following you!', NOW())",
-                    new() { ["@targetId"] = targetId, ["@followerId"] = followerId }, tx);
+                    INSERT INTO notifications (id, user_id, notification_type, actor_id, title, message, action_url, created_at)
+                    VALUES (uuid_generate_v4(), @targetId, 'follow'::notification_type, @followerId, 'New Follower', @msg, @actionUrl, NOW())",
+                    new Dictionary<string, object?>
+                    {
+                        ["@targetId"]  = targetId,
+                        ["@followerId"] = followerId,
+                        ["@msg"]        = $"{followerUsername ?? "Someone"} ne aapko follow kiya!",
+                        ["@actionUrl"]  = $"/user/{followerUsername}"
+                    }, tx);
             }
 
             await tx.CommitAsync();
+
+            // FCM push to followed user (non-blocking, after commit)
+            if (inserted > 0)
+            {
+                var followerUsername = await DbHelper.ExecuteScalarAsync<string?>(conn,
+                    "SELECT username FROM users WHERE id = @id",
+                    new Dictionary<string, object?> { ["id"] = followerId });
+                _ = _fcm.SendToUserAsync(
+                    targetId,
+                    "New Follower",
+                    $"{followerUsername ?? "Someone"} ne aapko follow kiya!",
+                    "follow",
+                    new Dictionary<string, string>
+                    {
+                        ["action_url"]       = $"/user/{followerUsername}",
+                        ["actor_username"]   = followerUsername ?? ""
+                    });
+            }
         }
         catch (Exception ex)
         {
@@ -876,5 +909,28 @@ public class UserService : IUserService
             CoinsPerReferral = 100,
             ReferredUsers   = referredUsers,
         };
+    }
+    // ─── REGISTER FCM DEVICE TOKEN ────────────────────────────────────────────
+    public async Task<(bool Success, string Message)> RegisterDeviceAsync(
+        Guid userId, string deviceToken, string deviceType, string appVersion)
+    {
+        if (string.IsNullOrWhiteSpace(deviceToken))
+            return (false, "Device token required");
+
+        await using var conn = await _db.CreateConnectionAsync();
+        await DbHelper.ExecuteNonQueryAsync(conn,
+            @"INSERT INTO user_devices (id, user_id, device_token, device_type, app_version, is_active, last_used_at, created_at)
+              VALUES (uuid_generate_v4(), @uid, @token, @dtype, @version, TRUE, NOW(), NOW())
+              ON CONFLICT (user_id, device_token)
+              DO UPDATE SET is_active = TRUE, device_type = @dtype, app_version = @version, last_used_at = NOW()",
+            new Dictionary<string, object?>
+            {
+                ["uid"]     = userId,
+                ["token"]   = deviceToken,
+                ["dtype"]   = deviceType,
+                ["version"] = appVersion
+            });
+
+        return (true, "Device registered");
     }
 }

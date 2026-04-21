@@ -297,4 +297,20 @@ public class UsersController : ControllerBase
         var result = await _userService.GetBlockedUsersAsync(RequiredUserId, pagination);
         return Ok(ApiResponse<PagedResult<FollowUserResponse>>.Ok(result));
     }
+
+    // ─── REGISTER FCM DEVICE TOKEN ────────────────────────────────────────────
+    /// <summary>FCM device token register karo (login ke baad call karo)</summary>
+    [HttpPost("me/device")]
+    [Authorize]
+    public async Task<IActionResult> RegisterDevice([FromBody] RegisterDeviceRequest req)
+    {
+        var (success, message) = await _userService.RegisterDeviceAsync(
+            RequiredUserId,
+            req.DeviceToken,
+            req.DeviceType,
+            req.AppVersion ?? "1.0.0");
+
+        if (!success) return BadRequest(ApiResponse<object>.Fail(message));
+        return Ok(ApiResponse<object>.Ok(null, message));
+    }
 }
