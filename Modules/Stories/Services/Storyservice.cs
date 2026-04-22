@@ -36,6 +36,7 @@ public interface IStoryService
     Task<(bool Success, string Message)> UnbookmarkStoryAsync(Guid userId, Guid storyId);
     Task<PagedResult<StoryResponse>> GetBookmarkedStoriesAsync(Guid userId, int page, int pageSize);
     Task RecordViewAsync(Guid storyId, Guid? episodeId, Guid? userId, string ipAddress, string? userAgent);
+    Task<(bool Success, string Message)> CompleteEpisodeAsync(Guid userId, Guid storyId, Guid episodeId);
 
     // Unlock
     Task<(bool Success, string Message)> UnlockEpisodeAsync(Guid userId, Guid episodeId);
@@ -1162,12 +1163,66 @@ public class StoryService : IStoryService
                 "UPDATE stories SET total_views=total_views+1 WHERE id=@id",
                 new() { ["@id"] = storyId });
 
+            // Also increment the creator's total_views_received on the users table.
+            await DbHelper.ExecuteNonQueryAsync(conn,
+                @"UPDATE users SET total_views_received = total_views_received + 1
+                  WHERE id = (SELECT creator_id FROM stories WHERE id = @sid AND deleted_at IS NULL)",
+                new() { ["@sid"] = storyId });
+
             if (episodeId.HasValue)
                 await DbHelper.ExecuteNonQueryAsync(conn,
                     "UPDATE episodes SET total_views=total_views+1 WHERE id=@id",
                     new() { ["@id"] = episodeId });
         }
         catch { }
+    }
+
+    // ─── COMPLETE EPISODE (grants +25 reader XP, once per episode) ──────────
+    public async Task<(bool Success, string Message)> CompleteEpisodeAsync(Guid userId, Guid storyId, Guid episodeId)
+    {
+        try
+        {
+            await using var conn = await _db.CreateConnectionAsync();
+
+            // Check if already completed — only grant XP once per episode per user.
+            var already = await DbHelper.ExecuteScalarAsync<int>(conn,
+                @"SELECT COUNT(1) FROM reading_history
+                  WHERE user_id = @uid AND episode_id = @eid AND is_completed = TRUE",
+                new() { ["@uid"] = userId, ["@eid"] = episodeId });
+
+            // Upsert reading_history row.
+            await DbHelper.ExecuteNonQueryAsync(conn, @"
+                INSERT INTO reading_history (id, user_id, story_id, episode_id, is_completed, read_duration_seconds, scroll_percentage, started_at, last_read_at, completed_at)
+                VALUES (uuid_generate_v4(), @uid, @sid, @eid, TRUE, 0, 100, NOW(), NOW(), NOW())
+                ON CONFLICT (user_id, episode_id)
+                DO UPDATE SET is_completed = TRUE, completed_at = NOW(), last_read_at = NOW()",
+                new() { ["@uid"] = userId, ["@sid"] = storyId, ["@eid"] = episodeId });
+
+            if (already > 0)
+                return (true, "Already completed");
+
+            // Grant +25 XP and update reader_fear_rank.
+            await DbHelper.ExecuteNonQueryAsync(conn, @"
+                UPDATE users SET
+                    reader_rank_score         = reader_rank_score + 25,
+                    total_reading_time_minutes = total_reading_time_minutes + 15,
+                    reader_fear_rank          = CASE
+                        WHEN reader_rank_score + 25 >= 10000 THEN 'mahakaal_bhakt'
+                        WHEN reader_rank_score + 25 >= 4000  THEN 'horror_bhakt'
+                        WHEN reader_rank_score + 25 >= 1500  THEN 'shamshaan_premi'
+                        WHEN reader_rank_score + 25 >= 500   THEN 'andheri_gali_explorer'
+                        ELSE 'raat_ka_musafir'
+                    END
+                WHERE id = @uid",
+                new() { ["@uid"] = userId });
+
+            return (true, "Episode complete! +25 XP mila");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "CompleteEpisode failed uid={U} eid={E}", userId, episodeId);
+            return (false, "Error");
+        }
     }
 
     // ─── UNLOCK EPISODE ───────────────────────────────────────────────────────

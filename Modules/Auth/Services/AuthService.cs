@@ -265,6 +265,46 @@ public class AuthService : IAuthService
                   END)
             WHERE id = @id",
             new() { ["@id"] = userId });
+
+        // Grant +10 reader XP for daily login (only once per IST day) and update reader_fear_rank.
+        await DbHelper.ExecuteNonQueryAsync(writeConn, @"
+            UPDATE users SET
+                reader_rank_score = CASE
+                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                         date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                    THEN reader_rank_score + 10
+                    ELSE reader_rank_score
+                END,
+                reader_fear_rank = CASE
+                    WHEN (CASE
+                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                 date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                            THEN reader_rank_score + 10
+                            ELSE reader_rank_score
+                          END) >= 10000 THEN 'mahakaal_bhakt'
+                    WHEN (CASE
+                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                 date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                            THEN reader_rank_score + 10
+                            ELSE reader_rank_score
+                          END) >= 4000  THEN 'horror_bhakt'
+                    WHEN (CASE
+                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                 date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                            THEN reader_rank_score + 10
+                            ELSE reader_rank_score
+                          END) >= 1500  THEN 'shamshaan_premi'
+                    WHEN (CASE
+                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                 date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                            THEN reader_rank_score + 10
+                            ELSE reader_rank_score
+                          END) >= 500   THEN 'andheri_gali_explorer'
+                    ELSE 'raat_ka_musafir'
+                END
+            WHERE id = @id",
+            new() { ["@id"] = userId });
+
         _ = LogLoginAsync(userId, ipAddress, "email", true);
 
         var at = _jwtService.GenerateAccessToken(userInfo);
@@ -313,6 +353,67 @@ public class AuthService : IAuthService
                         CreatorFearRank=DbHelper.GetStringOrNull(r,"creator_fear_rank"), CoinBalance=DbHelper.GetLong(r,"coin_balance") };
             }
             if (eu==null) return (false, "Account issue hai", null);
+
+            // Same streak + daily XP logic as email login.
+            await using (var sc = await _db.CreateConnectionAsync())
+                await DbHelper.ExecuteNonQueryAsync(sc, @"
+                    UPDATE users SET
+                        last_login_at    = NOW(),
+                        last_active_at   = NOW(),
+                        login_streak     = CASE
+                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
+                                 date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                            THEN login_streak
+                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
+                                 date_trunc('day', (NOW() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '1 day')
+                            THEN login_streak + 1
+                            ELSE 1
+                          END,
+                        max_login_streak = GREATEST(max_login_streak, CASE
+                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
+                                 date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                            THEN login_streak
+                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
+                                 date_trunc('day', (NOW() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '1 day')
+                            THEN login_streak + 1
+                            ELSE 1
+                          END),
+                        reader_rank_score = CASE
+                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                 date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                            THEN reader_rank_score + 10
+                            ELSE reader_rank_score
+                          END,
+                        reader_fear_rank = CASE
+                            WHEN (CASE
+                                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                         date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                                    THEN reader_rank_score + 10
+                                    ELSE reader_rank_score
+                                  END) >= 10000 THEN 'mahakaal_bhakt'
+                            WHEN (CASE
+                                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                         date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                                    THEN reader_rank_score + 10
+                                    ELSE reader_rank_score
+                                  END) >= 4000  THEN 'horror_bhakt'
+                            WHEN (CASE
+                                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                         date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                                    THEN reader_rank_score + 10
+                                    ELSE reader_rank_score
+                                  END) >= 1500  THEN 'shamshaan_premi'
+                            WHEN (CASE
+                                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                         date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                                    THEN reader_rank_score + 10
+                                    ELSE reader_rank_score
+                                  END) >= 500   THEN 'andheri_gali_explorer'
+                            ELSE 'raat_ka_musafir'
+                          END
+                    WHERE id = @id",
+                    new() { ["@id"] = existingUserId.Value });
+
             var at=_jwtService.GenerateAccessToken(eu); var rt=_jwtService.GenerateRefreshToken();
             await SaveRefreshTokenAsync(existingUserId.Value, rt, ipAddress);
             return (true,"Google login successful",new AuthResponse{AccessToken=at,RefreshToken=rt,

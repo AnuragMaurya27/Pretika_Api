@@ -218,6 +218,20 @@ public class CommentService : ICommentService
             "UPDATE stories SET total_comments = total_comments + 1 WHERE id = @storyId",
             new Dictionary<string, object?> { ["storyId"] = req.StoryId });
 
+        // Grant +5 reader XP for posting a comment and update reader_fear_rank.
+        await DbHelper.ExecuteNonQueryAsync(conn, @"
+            UPDATE users SET
+                reader_rank_score = reader_rank_score + 5,
+                reader_fear_rank  = CASE
+                    WHEN reader_rank_score + 5 >= 10000 THEN 'mahakaal_bhakt'
+                    WHEN reader_rank_score + 5 >= 4000  THEN 'horror_bhakt'
+                    WHEN reader_rank_score + 5 >= 1500  THEN 'shamshaan_premi'
+                    WHEN reader_rank_score + 5 >= 500   THEN 'andheri_gali_explorer'
+                    ELSE 'raat_ka_musafir'
+                END
+            WHERE id = @uid",
+            new Dictionary<string, object?> { ["uid"] = userId });
+
         // Fetch created comment
         var sql = @"
             SELECT c.id, c.story_id, c.episode_id, c.parent_comment_id, c.content,

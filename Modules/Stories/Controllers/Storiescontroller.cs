@@ -325,6 +325,16 @@ public class StoriesController : ControllerBase
         return Ok(ApiResponse<object>.Ok(data, message));
     }
 
+    /// <summary>Episode complete mark karo — +25 reader XP milega (ek baar)</summary>
+    [HttpPost("{storyId:guid}/episodes/{episodeId:guid}/complete")]
+    [Authorize]
+    public async Task<IActionResult> CompleteEpisode(Guid storyId, Guid episodeId)
+    {
+        var (success, message) = await _storyService.CompleteEpisodeAsync(RequiredUserId, storyId, episodeId);
+        if (!success) return BadRequest(ApiResponse<object>.Fail(message));
+        return Ok(ApiResponse<object>.Ok(null, message));
+    }
+
     /// <summary>Premium episode unlock karo coins se</summary>
     [HttpPost("episodes/{episodeId:guid}/unlock")]
     [Authorize]

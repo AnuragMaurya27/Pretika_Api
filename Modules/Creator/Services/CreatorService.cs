@@ -272,6 +272,13 @@ public class CreatorService : ICreatorService
         var (rankName, rankKey, rankIcon, rankLevel, rankMin, rankNext, nextRankName, rankProgress) = GetFearRank(fearScore);
         var (tier, tierIcon, tierShare, nextTierViews, tierProgress) = GetCreatorTier(thisMonthViews);
 
+        // Persist creator_rank_score and creator_fear_rank back to users table
+        // so GET /api/users/me always returns up-to-date rank data.
+        await DbHelper.ExecuteNonQueryAsync(conn,
+            @"UPDATE users SET creator_rank_score = @score, creator_fear_rank = @rankKey::creator_rank
+              WHERE id = @uid",
+            new Dictionary<string, object?> { ["score"] = (decimal)fearScore, ["rankKey"] = rankKey, ["uid"] = userId });
+
         // BUG#M5-3 FIX: Include premium unlock earnings in totals.
         long premiumTotal      = premiumUnlockEarnings?.Total     ?? 0;
         long premiumThisMonth  = premiumUnlockEarnings?.ThisMonth ?? 0;
