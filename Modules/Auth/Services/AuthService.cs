@@ -333,91 +333,104 @@ public class AuthService : IAuthService
 
         if (existingUserId.HasValue)
         {
-            UserAuthInfo? eu = null;
-            await using (var rc = await _db.CreateConnectionAsync())
+            try
             {
-                using var cmd = new NpgsqlCommand(@"
-                    SELECT u.id,u.username,u.email,u.display_name,u.avatar_url,u.role,u.status,
-                           u.is_email_verified,u.is_2fa_enabled,u.is_creator,u.reader_fear_rank,
-                           u.creator_fear_rank,COALESCE(w.coin_balance,0) as coin_balance
-                    FROM users u LEFT JOIN wallets w ON w.user_id=u.id
-                    WHERE u.id=@id AND u.deleted_at IS NULL", rc);
-                cmd.Parameters.AddWithValue("@id", existingUserId.Value);
-                using var r = await cmd.ExecuteReaderAsync();
-                if (await r.ReadAsync())
-                    eu = new UserAuthInfo { Id=DbHelper.GetGuid(r,"id"), Username=DbHelper.GetString(r,"username"),
-                        Email=DbHelper.GetString(r,"email"), DisplayName=DbHelper.GetStringOrNull(r,"display_name"),
-                        AvatarUrl=DbHelper.GetStringOrNull(r,"avatar_url"), Role=DbHelper.GetString(r,"role"),
-                        IsCreator=DbHelper.GetBool(r,"is_creator"), IsEmailVerified=DbHelper.GetBool(r,"is_email_verified"),
-                        Is2FAEnabled=DbHelper.GetBool(r,"is_2fa_enabled"), ReaderFearRank=DbHelper.GetString(r,"reader_fear_rank"),
-                        CreatorFearRank=DbHelper.GetStringOrNull(r,"creator_fear_rank"), CoinBalance=DbHelper.GetLong(r,"coin_balance") };
+                UserAuthInfo? eu = null;
+                await using (var rc = await _db.CreateConnectionAsync())
+                {
+                    using var cmd = new NpgsqlCommand(@"
+                        SELECT u.id,u.username,u.email,u.display_name,u.avatar_url,u.role,u.status,
+                               u.is_email_verified,u.is_2fa_enabled,u.is_creator,u.reader_fear_rank,
+                               u.creator_fear_rank,COALESCE(w.coin_balance,0) as coin_balance
+                        FROM users u LEFT JOIN wallets w ON w.user_id=u.id
+                        WHERE u.id=@id AND u.deleted_at IS NULL", rc);
+                    cmd.Parameters.AddWithValue("@id", existingUserId.Value);
+                    using var r = await cmd.ExecuteReaderAsync();
+                    if (await r.ReadAsync())
+                        eu = new UserAuthInfo { Id=DbHelper.GetGuid(r,"id"), Username=DbHelper.GetString(r,"username"),
+                            Email=DbHelper.GetString(r,"email"), DisplayName=DbHelper.GetStringOrNull(r,"display_name"),
+                            AvatarUrl=DbHelper.GetStringOrNull(r,"avatar_url"), Role=DbHelper.GetString(r,"role"),
+                            IsCreator=DbHelper.GetBool(r,"is_creator"), IsEmailVerified=DbHelper.GetBool(r,"is_email_verified"),
+                            Is2FAEnabled=DbHelper.GetBool(r,"is_2fa_enabled"), ReaderFearRank=DbHelper.GetString(r,"reader_fear_rank"),
+                            CreatorFearRank=DbHelper.GetStringOrNull(r,"creator_fear_rank"), CoinBalance=DbHelper.GetLong(r,"coin_balance") };
+                }
+                if (eu==null) return (false, "Account issue hai", null);
+
+                // Same streak + daily XP logic as email login.
+                try
+                {
+                    await using var sc = await _db.CreateConnectionAsync();
+                    await DbHelper.ExecuteNonQueryAsync(sc, @"
+                        UPDATE users SET
+                            last_login_at    = NOW(),
+                            last_active_at   = NOW(),
+                            login_streak     = CASE
+                                WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
+                                     date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                                THEN login_streak
+                                WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
+                                     date_trunc('day', (NOW() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '1 day')
+                                THEN login_streak + 1
+                                ELSE 1
+                              END,
+                            max_login_streak = GREATEST(max_login_streak, CASE
+                                WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
+                                     date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                                THEN login_streak
+                                WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
+                                     date_trunc('day', (NOW() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '1 day')
+                                THEN login_streak + 1
+                                ELSE 1
+                              END),
+                            reader_rank_score = CASE
+                                WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                     date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                                THEN reader_rank_score + 10
+                                ELSE reader_rank_score
+                              END,
+                            reader_fear_rank = CASE
+                                WHEN (CASE
+                                        WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                             date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                                        THEN reader_rank_score + 10
+                                        ELSE reader_rank_score
+                                      END) >= 10000 THEN 'mahakaal_bhakt'
+                                WHEN (CASE
+                                        WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                             date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                                        THEN reader_rank_score + 10
+                                        ELSE reader_rank_score
+                                      END) >= 4000  THEN 'horror_bhakt'
+                                WHEN (CASE
+                                        WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                             date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                                        THEN reader_rank_score + 10
+                                        ELSE reader_rank_score
+                                      END) >= 1500  THEN 'shamshaan_premi'
+                                WHEN (CASE
+                                        WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
+                                             date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
+                                        THEN reader_rank_score + 10
+                                        ELSE reader_rank_score
+                                      END) >= 500   THEN 'andheri_gali_explorer'
+                                ELSE 'raat_ka_musafir'
+                              END
+                        WHERE id = @id",
+                        new() { ["@id"] = existingUserId.Value });
+                }
+                catch (Exception ex) { _logger.LogWarning(ex, "Streak update failed for Google user {Id}", existingUserId.Value); }
+
+                var at=_jwtService.GenerateAccessToken(eu); var rt=_jwtService.GenerateRefreshToken();
+                try { await SaveRefreshTokenAsync(existingUserId.Value, rt, ipAddress); }
+                catch (Exception ex) { _logger.LogWarning(ex, "SaveRefreshToken failed for Google user {Id}", existingUserId.Value); }
+                return (true,"Google login successful",new AuthResponse{AccessToken=at,RefreshToken=rt,
+                    AccessTokenExpiry=DateTime.UtcNow.AddMinutes(60),RefreshTokenExpiry=DateTime.UtcNow.AddDays(30),User=eu});
             }
-            if (eu==null) return (false, "Account issue hai", null);
-
-            // Same streak + daily XP logic as email login.
-            await using (var sc = await _db.CreateConnectionAsync())
-                await DbHelper.ExecuteNonQueryAsync(sc, @"
-                    UPDATE users SET
-                        last_login_at    = NOW(),
-                        last_active_at   = NOW(),
-                        login_streak     = CASE
-                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
-                                 date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
-                            THEN login_streak
-                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
-                                 date_trunc('day', (NOW() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '1 day')
-                            THEN login_streak + 1
-                            ELSE 1
-                          END,
-                        max_login_streak = GREATEST(max_login_streak, CASE
-                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
-                                 date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
-                            THEN login_streak
-                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') =
-                                 date_trunc('day', (NOW() AT TIME ZONE 'Asia/Kolkata') - INTERVAL '1 day')
-                            THEN login_streak + 1
-                            ELSE 1
-                          END),
-                        reader_rank_score = CASE
-                            WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
-                                 date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
-                            THEN reader_rank_score + 10
-                            ELSE reader_rank_score
-                          END,
-                        reader_fear_rank = CASE
-                            WHEN (CASE
-                                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
-                                         date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
-                                    THEN reader_rank_score + 10
-                                    ELSE reader_rank_score
-                                  END) >= 10000 THEN 'mahakaal_bhakt'
-                            WHEN (CASE
-                                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
-                                         date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
-                                    THEN reader_rank_score + 10
-                                    ELSE reader_rank_score
-                                  END) >= 4000  THEN 'horror_bhakt'
-                            WHEN (CASE
-                                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
-                                         date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
-                                    THEN reader_rank_score + 10
-                                    ELSE reader_rank_score
-                                  END) >= 1500  THEN 'shamshaan_premi'
-                            WHEN (CASE
-                                    WHEN date_trunc('day', last_login_at AT TIME ZONE 'Asia/Kolkata') <
-                                         date_trunc('day', NOW() AT TIME ZONE 'Asia/Kolkata')
-                                    THEN reader_rank_score + 10
-                                    ELSE reader_rank_score
-                                  END) >= 500   THEN 'andheri_gali_explorer'
-                            ELSE 'raat_ka_musafir'
-                          END
-                    WHERE id = @id",
-                    new() { ["@id"] = existingUserId.Value });
-
-            var at=_jwtService.GenerateAccessToken(eu); var rt=_jwtService.GenerateRefreshToken();
-            await SaveRefreshTokenAsync(existingUserId.Value, rt, ipAddress);
-            return (true,"Google login successful",new AuthResponse{AccessToken=at,RefreshToken=rt,
-                AccessTokenExpiry=DateTime.UtcNow.AddMinutes(60),RefreshTokenExpiry=DateTime.UtcNow.AddDays(30),User=eu});
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Google login existing user failed {Id}", existingUserId.Value);
+                return (false, "Google login failed. Dobara try karo.", null);
+            }
         }
 
         var newUserId = Guid.NewGuid();
@@ -487,7 +500,8 @@ public class AuthService : IAuthService
             DisplayName=payload.Name,AvatarUrl=payload.Picture,Role="reader",IsCreator=false,
             IsEmailVerified=true,ReaderFearRank="raat_ka_musafir",CoinBalance=50};
         var nat=_jwtService.GenerateAccessToken(nu); var nrt=_jwtService.GenerateRefreshToken();
-        await SaveRefreshTokenAsync(newUserId, nrt, ipAddress);
+        try { await SaveRefreshTokenAsync(newUserId, nrt, ipAddress); }
+        catch (Exception ex) { _logger.LogWarning(ex, "SaveRefreshToken failed for new Google user {Id}", newUserId); }
         return (true,"Google se register successful!",new AuthResponse{AccessToken=nat,RefreshToken=nrt,
             AccessTokenExpiry=DateTime.UtcNow.AddMinutes(60),RefreshTokenExpiry=DateTime.UtcNow.AddDays(30),User=nu});
     }
