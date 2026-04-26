@@ -96,6 +96,10 @@ public class ReferralStatsResponse
 
 public class UpdateProfileRequest
 {
+    [MinLength(3), MaxLength(50)]
+    [RegularExpression(@"^[a-zA-Z0-9_]+$", ErrorMessage = "Username mein sirf letters, numbers aur _ allowed hain")]
+    public string? Username { get; set; }
+
     [MaxLength(100)]
     public string? DisplayName { get; set; }
 

@@ -159,6 +159,18 @@ public class UserService : IUserService
         var updates = new List<string>();
         var params_ = new Dictionary<string, object?> { ["@id"] = userId };
 
+        if (req.Username != null)
+        {
+            var newUsername = req.Username.Trim().ToLower();
+            // Check uniqueness — exclude current user
+            await using var uc = await _db.CreateConnectionAsync();
+            var taken = await DbHelper.ExecuteScalarAsync<int>(uc,
+                "SELECT COUNT(1) FROM users WHERE LOWER(username)=@u AND id<>@id",
+                new() { ["@u"] = newUsername, ["@id"] = userId });
+            if (taken > 0) return (false, "Yeh username pehle se kisi aur ne le rakha hai");
+            updates.Add("username=@uname"); params_["@uname"] = newUsername;
+        }
+
         if (req.DisplayName != null) { updates.Add("display_name=@dn"); params_["@dn"] = req.DisplayName; }
         if (req.Bio != null) { updates.Add("bio=@bio"); params_["@bio"] = req.Bio; }
         if (req.Phone != null) { updates.Add("phone=@phone"); params_["@phone"] = req.Phone; }

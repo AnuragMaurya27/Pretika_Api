@@ -44,6 +44,8 @@ public class GoogleLoginRequest
 {
     [Required]
     public string IdToken { get; set; } = "";
+
+    public string? ReferralCode { get; set; }
 }
 
 public class ForgotPasswordRequest

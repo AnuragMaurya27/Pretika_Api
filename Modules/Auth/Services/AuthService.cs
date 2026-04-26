@@ -426,16 +426,27 @@ public class AuthService : IAuthService
         await using (var uc = await _db.CreateConnectionAsync())
             username = await GenerateUniqueUsernameAsync(uc, baseUname);
 
+        // Resolve referral code → referrer user id
+        Guid? referredBy = null;
+        if (!string.IsNullOrWhiteSpace(req.ReferralCode))
+        {
+            await using var rc2 = await _db.CreateConnectionAsync();
+            referredBy = await DbHelper.ExecuteScalarAsync<Guid?>(rc2,
+                "SELECT id FROM users WHERE referral_code=@code",
+                new() { ["@code"] = req.ReferralCode.Trim().ToUpper() });
+        }
+
         await using var wc = await _db.CreateConnectionAsync();
         await using var tx = await wc.BeginTransactionAsync();
         bool committed = false;
         try
         {
             await DbHelper.ExecuteNonQueryAsync(wc, @"
-                INSERT INTO users (id,username,email,display_name,avatar_url,role,status,is_email_verified,referral_code,created_at,updated_at)
-                VALUES (@id,@u,@e,@dn,@av,'reader'::user_role,'active'::user_status,TRUE,@rc,NOW(),NOW())",
+                INSERT INTO users (id,username,email,display_name,avatar_url,role,status,is_email_verified,referral_code,referred_by,created_at,updated_at)
+                VALUES (@id,@u,@e,@dn,@av,'reader'::user_role,'active'::user_status,TRUE,@rc,@referredBy,NOW(),NOW())",
                 new(){["@id"]=newUserId,["@u"]=username,["@e"]=payload.Email,["@dn"]=payload.Name??username,
-                    ["@av"]=(object?)payload.Picture??DBNull.Value,["@rc"]=GenerateReferralCode(username)}, tx);
+                    ["@av"]=(object?)payload.Picture??DBNull.Value,["@rc"]=GenerateReferralCode(username),
+                    ["@referredBy"]=(object?)referredBy??DBNull.Value}, tx);
             await DbHelper.ExecuteNonQueryAsync(wc,
                 "INSERT INTO oauth_accounts (id,user_id,provider,provider_user_id,provider_email,created_at,updated_at) VALUES (uuid_generate_v4(),@uid,'google'::oauth_provider,@gid,@e,NOW(),NOW())",
                 new(){["@uid"]=newUserId,["@gid"]=payload.Subject,["@e"]=payload.Email}, tx);
@@ -444,6 +455,25 @@ public class AuthService : IAuthService
             await DbHelper.ExecuteNonQueryAsync(wc,
                 "UPDATE wallets SET coin_balance=50, total_earned=50 WHERE user_id=@uid",
                 new(){["@uid"]=newUserId}, tx);
+            // Award referral bonus: +100 coins to referrer, increment their total_referrals
+            if (referredBy.HasValue)
+            {
+                await DbHelper.ExecuteNonQueryAsync(wc,
+                    "UPDATE wallets SET coin_balance=coin_balance+100, total_earned=total_earned+100, updated_at=NOW() WHERE user_id=@uid",
+                    new(){["@uid"]=referredBy.Value}, tx);
+                await DbHelper.ExecuteNonQueryAsync(wc,
+                    "UPDATE users SET total_referrals=total_referrals+1, updated_at=NOW() WHERE id=@uid",
+                    new(){["@uid"]=referredBy.Value}, tx);
+                await DbHelper.ExecuteNonQueryAsync(wc, @"
+                    INSERT INTO coin_transactions (id,sender_id,receiver_id,transaction_type,amount,description,status,created_at)
+                    VALUES (uuid_generate_v4(),@newUid,@refUid,'referral_bonus'::transaction_type,100,'Referral bonus - new user joined via your code','completed'::transaction_status,NOW())",
+                    new(){["@newUid"]=newUserId,["@refUid"]=referredBy.Value}, tx);
+                await DbHelper.ExecuteNonQueryAsync(wc, @"
+                    INSERT INTO referrals (id,referrer_id,referee_id,referral_code,referrer_bonus_coins,referee_bonus_coins,is_valid,created_at)
+                    VALUES (uuid_generate_v4(),@refUid,@newUid,@code,100,0,TRUE,NOW())",
+                    new(){["@refUid"]=referredBy.Value,["@newUid"]=newUserId,
+                          ["@code"]=req.ReferralCode!.Trim().ToUpper()}, tx);
+            }
             await tx.CommitAsync(); committed=true;
         }
         catch (Exception ex)
